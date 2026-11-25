@@ -1,0 +1,6 @@
+{
+  "name": "SiteGrab",
+  "description": "Capture a deployed website you own or have permission to copy as a ready-to-run offline ZIP archive with rewritten relative paths, Prettier formatting, and source map recovery.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

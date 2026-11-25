@@ -1,0 +1,21 @@
+{
+  "name": "sitegrab-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Backend capture, SSRF protection, asset rewriting, source map recovery, and ZIP streaming service for SiteGrab.",
+  "main": "app.ts",
+  "scripts": {
+    "dev": "tsx ../server.ts",
+    "start": "tsx ../server.ts"
+  },
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "cheerio": "^1.0.0",
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2",
+    "ipaddr.js": "^2.2.0",
+    "playwright": "^1.59.1",
+    "prettier": "^3.8.3"
+  }
+}

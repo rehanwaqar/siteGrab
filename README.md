@@ -1,11 +1,73 @@
-<div align="center">
+# SiteGrab
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+Capture a deployed website you own or have permission to copy as a ready-to-run offline ZIP project you can open directly in VS Code.
 
-  <h1>Built with AI Studio</h2>
+> **Acceptable Use:** Only use SiteGrab on websites you own or have explicit permission to copy.
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+## Features
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
+- **Headless Chromium Capture**: Opens the target URL in an isolated browser context, waits for network idle, and scrolls incrementally to trigger lazy-loaded assets.
+- **Asset & Path Rewriting**: Captures HTML, CSS, JS, images, fonts, and JSON, then rewrites absolute and CDN URLs to relative local paths (`index.html`, `/assets/css`, `/assets/js`, `/assets/images`, `/assets/fonts`).
+- **Source Map Recovery**: Detects published `.map` source maps and reconstructs the original source folder tree under `/recovered-src`.
+- **Prettier Auto-Formatting**: Programmatically formats captured HTML, CSS, and JavaScript so the exported code is clean and readable.
+- **Multi-Page Crawl**: Optionally follow same-origin internal links up to depth 1–3 and a configurable page limit.
+- **Live SSE Progress & Sandboxed Preview**: Streams real-time capture progress over Server-Sent Events and lets you inspect the offline bundle in a sandboxed `<iframe>` before downloading.
+- **Download History**: Persists recent capture summaries locally in `localStorage`.
 
-</div>
+## Security & Limits
+
+- Allows only `http://` and `https://` URLs.
+- Resolves DNS and blocks loopback, private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local (`169.254.0.0/16`), and reserved IPv4/IPv6 ranges before navigation, across redirects, and on every subresource request.
+- Respects `robots.txt` policies.
+- Per-IP rate limit of **5 captures per 10 minutes**.
+- Job limits: **100 MB** max total size, **500 files** max, **60-second** timeout, fresh isolated browser context per job, and automatic temporary file deletion after ZIP download.
+
+## Project Structure
+
+- `/server` — Express API, SSRF/DNS validator, `robots.txt` checker, Playwright capture pipeline, URL rewriter, source map extractor, Prettier formatter, and ZIP builder.
+- `/client` — React + Tailwind CSS frontend components, progress view, sandboxed preview panel, history view, and terms page.
+- `/server.ts` — Full-stack entry point mounting `/api/*` routes alongside Vite (development) or `/dist` (production).
+- `/Dockerfile` — Container build configured with Playwright Chromium dependencies.
+
+## Local Setup & Run
+
+### 1. Install dependencies & Playwright Chromium
+
+```bash
+npm install
+npx playwright install chromium
+```
+
+### 2. Run in development mode
+
+```bash
+npm run dev
+```
+
+Open `http://localhost:3000`.
+
+### 3. Build & run in production mode
+
+```bash
+npm run build
+NODE_ENV=production npm run start
+```
+
+## Deploying with Docker (Render, Railway, Fly.io)
+
+### Render
+1. Push this repository to GitHub.
+2. Create a new **Web Service** on Render and select **Docker** as the runtime.
+3. Render automatically builds using `/Dockerfile` and routes traffic to port `3000`.
+
+### Railway
+1. Create a new Railway project from your GitHub repo.
+2. Railway detects `/Dockerfile`, installs Playwright Chromium, builds `/dist`, and exposes port `3000`.
+
+### Fly.io
+```bash
+fly launch --no-deploy
+fly secrets set NODE_ENV=production
+fly deploy
+```
+Ensure your `fly.toml` internal port matches `3000`.
