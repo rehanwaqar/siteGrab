@@ -103,3 +103,21 @@ export interface CaptureJob {
   cleaned: boolean;
   subscribers: Set<(event: ProgressEvent) => void>;
 }
+
+export type FeedbackCategory =
+  | 'Experience'
+  | 'Feature Idea'
+  | 'UI / UX'
+  | 'Capture Engine'
+  | 'Bug Report';
+
+export interface FeedbackEntry {
+  id: string;
+  authorName: string;
+  rating: number;
+  category: FeedbackCategory;
+  experience: string;
+  suggestion: string;
+  createdAt: number;
+}
+

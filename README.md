@@ -73,3 +73,10 @@ fly secrets set NODE_ENV=production
 fly deploy
 ```
 Ensure your `fly.toml` internal port matches `3000`.
+
+## Author
+
+**Mohammed Waqar Ahmed**
+- GitHub: [github.com/rehanwaqar](https://github.com/rehanwaqar)
+- LinkedIn: [linkedin.com/in/mohammed-waqar-ahmed-38a856322](https://www.linkedin.com/in/mohammed-waqar-ahmed-38a856322/)
+

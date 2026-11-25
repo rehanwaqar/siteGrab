@@ -13,6 +13,11 @@ import {
   type AiFileEdit,
 } from './ai.ts';
 import { CaptureError, runCaptureJob } from './capture.ts';
+import {
+  addFeedbackEntry,
+  FeedbackValidationError,
+  getFeedbackSummary,
+} from './feedback.ts';
 import { formatCapturedCode } from './formatter.ts';
 import { IpRateLimiter } from './rateLimit.ts';
 import { normalizeAndParseUrl, SsrfValidationError, validateExternalUrl } from './ssrf.ts';
@@ -61,6 +66,7 @@ export function createSiteGrabServer(): Express {
 
   const jobs = new Map<string, CaptureJob>();
   const rateLimiter = new IpRateLimiter(5, 10 * 60 * 1000);
+  const feedbackLimiter = new IpRateLimiter(10, 10 * 60 * 1000);
 
   async function cleanupJobFiles(job: CaptureJob): Promise<void> {
     if (job.cleaned) return;
@@ -76,6 +82,7 @@ export function createSiteGrabServer(): Express {
   const sweepTimer = setInterval(() => {
     const now = Date.now();
     rateLimiter.prune();
+    feedbackLimiter.prune();
     for (const [id, job] of jobs.entries()) {
       if (now > job.expiresAt) {
         void cleanupJobFiles(job);
@@ -99,6 +106,45 @@ export function createSiteGrabServer(): Express {
       chromiumInstalled,
       aiConfigured: Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY.trim()),
     });
+  });
+
+  app.get('/api/feedback', async (_req: Request, res: Response) => {
+    try {
+      const summary = await getFeedbackSummary();
+      res.json(summary);
+    } catch {
+      res.status(500).json({ error: 'Failed to load feedback.' });
+    }
+  });
+
+  app.post('/api/feedback', async (req: Request, res: Response) => {
+    const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+    const limitResult = feedbackLimiter.check(clientIp);
+    if (!limitResult.allowed) {
+      res.setHeader('Retry-After', String(limitResult.retryAfterSeconds));
+      res.status(429).json({
+        error: `Feedback rate limit reached. Please wait ${limitResult.retryAfterSeconds} seconds before submitting again.`,
+      });
+      return;
+    }
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    try {
+      const result = await addFeedbackEntry({
+        authorName: body.authorName,
+        rating: body.rating,
+        category: body.category,
+        experience: body.experience,
+        suggestion: body.suggestion,
+      });
+      res.status(201).json(result);
+    } catch (err) {
+      if (err instanceof FeedbackValidationError) {
+        res.status(400).json({ error: err.message });
+        return;
+      }
+      res.status(500).json({ error: 'Failed to save feedback.' });
+    }
   });
 
   app.post('/api/capture', async (req: Request, res: Response) => {

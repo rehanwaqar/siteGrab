@@ -2,13 +2,18 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import {
   AlertTriangle,
   Download,
+  ExternalLink,
+  Github,
   Globe,
+  Linkedin,
+  MessageSquarePlus,
   Moon,
   RotateCcw,
   ShieldAlert,
   SlidersHorizontal,
   Sun,
 } from 'lucide-react';
+import { FeedbackView } from './components/FeedbackView';
 import { HistoryView } from './components/HistoryView';
 import { PreviewPanel } from './components/PreviewPanel';
 import { ProgressPanel } from './components/ProgressPanel';
@@ -481,6 +486,17 @@ export default function App() {
             </button>
             <button
               type="button"
+              onClick={() => setActiveView('feedback')}
+              className={`whitespace-nowrap shrink-0 transition-colors cursor-pointer pb-0.5 border-b-2 ${
+                activeView === 'feedback'
+                  ? 'border-sky-500 text-slate-900 dark:text-slate-100'
+                  : 'border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100'
+              }`}
+            >
+              Feedback
+            </button>
+            <button
+              type="button"
               onClick={() => setActiveView('terms')}
               className={`whitespace-nowrap shrink-0 transition-colors cursor-pointer pb-0.5 border-b-2 ${
                 activeView === 'terms'
@@ -518,6 +534,8 @@ export default function App() {
             onSwitchToCapture={() => setActiveView('capture')}
           />
         )}
+
+        {activeView === 'feedback' && <FeedbackView />}
 
         {activeView === 'terms' && (
           <TermsView onBackToCapture={() => setActiveView('capture')} />
@@ -921,27 +939,111 @@ export default function App() {
         )}
       </main>
 
-      {/* Clean Minimal Footer */}
-      <footer className="border-t border-slate-200 dark:border-slate-800/80 px-4 sm:px-6 py-5">
-        <div className="mx-auto flex max-w-6xl flex-col sm:flex-row items-center justify-between gap-3 text-xs text-slate-500 dark:text-slate-400">
-          <span>
-            SiteGrab — Only use on websites you own or have permission to copy.
-          </span>
-          <div className="flex items-center gap-4">
-            <button
-              type="button"
-              onClick={() => setActiveView('terms')}
-              className="hover:text-slate-900 dark:hover:text-slate-200 transition-colors cursor-pointer"
-            >
-              Terms of Use
-            </button>
-            <button
-              type="button"
-              onClick={() => setActiveView('history')}
-              className="hover:text-slate-900 dark:hover:text-slate-200 transition-colors cursor-pointer"
-            >
-              Project History
-            </button>
+      {/* Structured Developer Footer */}
+      <footer className="border-t border-slate-200 dark:border-slate-800/80 bg-white/60 dark:bg-[#0B0F17] px-4 sm:px-6 py-8">
+        <div className="mx-auto max-w-6xl space-y-6">
+          <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-start">
+            {/* Column 1: Brand & Scope */}
+            <div className="md:col-span-5 space-y-2">
+              <div className="font-display text-base font-bold tracking-tight text-slate-900 dark:text-slate-100">
+                SiteGrab
+              </div>
+              <p className="text-xs text-slate-600 dark:text-slate-400 leading-relaxed max-w-md">
+                Website capture and offline development studio powered by headless Chromium. Export VS Code-ready archives, inspect diagnostics, and refine frontend code with AI.
+              </p>
+              <p className="text-[11px] text-slate-500 dark:text-slate-500">
+                Only capture websites you own or have explicit permission to copy.
+              </p>
+            </div>
+
+            {/* Column 2: Creator & Social Links */}
+            <div className="md:col-span-4 space-y-2.5">
+              <div className="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                Creator
+              </div>
+              <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                Mohammed Waqar Ahmed
+              </div>
+              <div className="flex flex-wrap items-center gap-2.5 pt-0.5">
+                <a
+                  href="https://github.com/rehanwaqar"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-300 hover:border-sky-500/60 hover:text-sky-600 dark:hover:text-sky-400 transition-colors"
+                >
+                  <Github className="h-3.5 w-3.5" />
+                  <span>GitHub</span>
+                  <ExternalLink className="h-3 w-3 opacity-60" />
+                </a>
+                <a
+                  href="https://www.linkedin.com/in/mohammed-waqar-ahmed-38a856322/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-300 hover:border-sky-500/60 hover:text-sky-600 dark:hover:text-sky-400 transition-colors"
+                >
+                  <Linkedin className="h-3.5 w-3.5" />
+                  <span>LinkedIn</span>
+                  <ExternalLink className="h-3 w-3 opacity-60" />
+                </a>
+              </div>
+            </div>
+
+            {/* Column 3: Feedback & Quick Links */}
+            <div className="md:col-span-3 space-y-2.5">
+              <div className="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                Feedback & Workspace
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setActiveView('feedback');
+                  window.scrollTo({ top: 0, behavior: 'smooth' });
+                }}
+                className="w-full sm:w-auto inline-flex items-center justify-center gap-2 rounded-lg border border-sky-500/40 bg-sky-500/10 hover:bg-sky-500/20 px-3.5 py-2 text-xs font-semibold text-sky-700 dark:text-sky-300 transition-colors cursor-pointer"
+              >
+                <MessageSquarePlus className="h-3.5 w-3.5 shrink-0" />
+                <span>Share Experience & Ideas</span>
+              </button>
+              <div className="flex flex-wrap items-center gap-4 pt-1 text-xs text-slate-500 dark:text-slate-400">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveView('history');
+                    window.scrollTo({ top: 0, behavior: 'smooth' });
+                  }}
+                  className="hover:text-slate-900 dark:hover:text-slate-200 transition-colors cursor-pointer"
+                >
+                  Project History
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveView('terms');
+                    window.scrollTo({ top: 0, behavior: 'smooth' });
+                  }}
+                  className="hover:text-slate-900 dark:hover:text-slate-200 transition-colors cursor-pointer"
+                >
+                  Terms of Use
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div className="border-t border-slate-200/80 dark:border-slate-800/70 pt-4 flex flex-col sm:flex-row items-center justify-between gap-2 text-[11px] text-slate-500 dark:text-slate-500">
+            <span>
+              Built by Mohammed Waqar Ahmed · Have an idea to improve SiteGrab?{' '}
+              <button
+                type="button"
+                onClick={() => {
+                  setActiveView('feedback');
+                  window.scrollTo({ top: 0, behavior: 'smooth' });
+                }}
+                className="text-sky-600 dark:text-sky-400 hover:underline cursor-pointer"
+              >
+                Send feedback
+              </button>
+            </span>
+            <span className="font-mono">Static capture · Local preview · VS Code ZIP</span>
           </div>
         </div>
       </footer>

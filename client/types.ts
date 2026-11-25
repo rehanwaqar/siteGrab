@@ -94,4 +94,28 @@ export interface HistoryEntry {
   options: Omit<CaptureOptions, 'url'>;
 }
 
-export type ActiveView = 'capture' | 'history' | 'terms';
+export type FeedbackCategory =
+  | 'Experience'
+  | 'Feature Idea'
+  | 'UI / UX'
+  | 'Capture Engine'
+  | 'Bug Report';
+
+export interface FeedbackEntry {
+  id: string;
+  authorName: string;
+  rating: number;
+  category: FeedbackCategory;
+  experience: string;
+  suggestion: string;
+  createdAt: number;
+}
+
+export interface FeedbackSummary {
+  items: FeedbackEntry[];
+  averageRating: number | null;
+  totalCount: number;
+}
+
+export type ActiveView = 'capture' | 'history' | 'feedback' | 'terms';
+
