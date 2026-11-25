@@ -1,7 +1,13 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { chromium, type Browser, type BrowserContext, type Response as PwResponse } from 'playwright';
+import {
+  chromium,
+  type Browser,
+  type BrowserContext,
+  type Request as PwRequest,
+  type Response as PwResponse,
+} from 'playwright';
 import { formatCapturedCode } from './formatter.ts';
 import {
   normalizeUrlKey,
@@ -17,9 +23,15 @@ import type {
   CapturedAsset,
   CaptureStage,
   CaptureStats,
+  FailedResourceEntry,
   ProgressEvent,
 } from './types.ts';
-import { createZipArchive, writeArchiveReadme } from './zipper.ts';
+import {
+  createZipArchive,
+  listDirectoryFiles,
+  writeArchivePackageJson,
+  writeArchiveReadme,
+} from './zipper.ts';
 
 export const MAX_TOTAL_BYTES = 100 * 1024 * 1024; // 100 MB
 export const MAX_FILES = 500;
@@ -156,10 +168,11 @@ function buildAssetRelPath(
     const u = new URL(urlStr);
     const rawBase = path.posix.basename(u.pathname) || 'asset';
     ext = path.posix.extname(rawBase).toLowerCase();
-    baseName = path.posix
-      .basename(rawBase, ext)
-      .replace(/[^a-zA-Z0-9._-]/g, '_')
-      .slice(0, 48) || 'asset';
+    baseName =
+      path.posix
+        .basename(rawBase, ext)
+        .replace(/[^a-zA-Z0-9._-]/g, '_')
+        .slice(0, 48) || 'asset';
   } catch {
     baseName = 'asset';
   }
@@ -228,9 +241,16 @@ function buildPageRelPath(
 
 export async function runCaptureJob(
   job: CaptureJob,
-  emit: (stage: CaptureStage, message: string, percent: number, detail?: string, errorCode?: string) => void,
+  emit: (
+    stage: CaptureStage,
+    message: string,
+    percent: number,
+    detail?: string,
+    errorCode?: string,
+  ) => void,
   stats: CaptureStats,
 ): Promise<void> {
+  const startTime = Date.now();
   const validatedHostCache = new Map<string, string[]>();
   const abortController = new AbortController();
   let timedOut = false;
@@ -248,6 +268,18 @@ export async function runCaptureJob(
   const usedPaths = new Set<string>();
   const assets = new Map<string, CapturedAsset>(); // normalizedUrl -> CapturedAsset
   const pages: CapturedPage[] = [];
+  const failedResources: FailedResourceEntry[] = [];
+  const failedSeen = new Set<string>();
+  const brokenImages: Array<{ src: string; page: string; reason: string }> = [];
+  const unresolvedLinks: Array<{ href: string; page: string; type: 'asset' | 'navigation' }> = [];
+  const intentionallyBlockedUrls = new Set<string>();
+
+  const recordFailedResource = (entry: FailedResourceEntry) => {
+    if (failedSeen.has(entry.url) || failedResources.length >= 100) return;
+    failedSeen.add(entry.url);
+    failedResources.push(entry);
+    stats.failedAssetsCount = failedResources.length;
+  };
 
   const checkAborted = () => {
     if (timedOut) {
@@ -294,26 +326,58 @@ export async function runCaptureJob(
 
     // 3. Launch Chromium in a fresh browser context
     emit('launching', 'Launching isolated Chromium browser context...', 18);
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-      ],
-    });
+    try {
+      browser = await chromium.launch({
+        headless: true,
+        channel: 'chromium',
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-gpu',
+          '--disable-blink-features=AutomationControlled',
+        ],
+      });
+    } catch (launchErr) {
+      const msg = launchErr instanceof Error ? launchErr.message : String(launchErr);
+      if (
+        msg.includes("Executable doesn't exist") ||
+        msg.includes('chromium') ||
+        msg.includes('playwright install')
+      ) {
+        throw new CaptureError(
+          'MISSING_CHROMIUM',
+          'Chromium browser binary is not installed in this environment. Run "npx playwright install chromium" on the server.',
+        );
+      }
+      throw new CaptureError('CAPTURE_FAILED', `Failed to launch browser: ${msg}`);
+    }
 
+    const majorVersion = browser.version().split('.')[0] || '136';
+    const isMobile = job.options.mobileViewport;
     context = await browser.newContext({
-      viewport: { width: 1440, height: 900 },
-      userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 SiteGrab/1.0',
+      viewport: isMobile ? { width: 390, height: 844 } : { width: 1440, height: 900 },
+      isMobile,
+      hasTouch: isMobile,
+      locale: 'en-US',
+      userAgent: isMobile
+        ? `Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${majorVersion}.0.0.0 Mobile Safari/537.36`
+        : `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${majorVersion}.0.0.0 Safari/537.36`,
+      extraHTTPHeaders: {
+        'Accept-Language': 'en-US,en;q=0.9',
+        'sec-ch-ua': `"Chromium";v="${majorVersion}", "Google Chrome";v="${majorVersion}", "Not-A.Brand";v="99"`,
+        'sec-ch-ua-mobile': isMobile ? '?1' : '?0',
+        'sec-ch-ua-platform': isMobile ? '"Android"' : '"Linux"',
+      },
       ignoreHTTPSErrors: false,
     });
 
-    // Enforce SSRF protection on every network request & redirect inside Chromium
+    // Enforce SSRF protection + optional image/font exclusions on every network request
     await context.route('**/*', async (route) => {
-      const reqUrl = route.request().url();
+      const req = route.request();
+      const reqUrl = req.url();
+      const rType = req.resourceType();
+
       if (
         reqUrl.startsWith('data:') ||
         reqUrl.startsWith('blob:') ||
@@ -323,10 +387,27 @@ export async function runCaptureJob(
         return;
       }
 
+      if (!job.options.includeImages && rType === 'image') {
+        intentionallyBlockedUrls.add(reqUrl);
+        await route.abort('blockedbyclient');
+        return;
+      }
+
+      if (!job.options.includeFonts && rType === 'font') {
+        intentionallyBlockedUrls.add(reqUrl);
+        await route.abort('blockedbyclient');
+        return;
+      }
+
       try {
         await validateExternalUrl(reqUrl, validatedHostCache);
         await route.continue();
-      } catch {
+      } catch (err) {
+        recordFailedResource({
+          url: reqUrl,
+          resourceType: rType,
+          reason: err instanceof Error ? err.message : 'Blocked internal/private address',
+        });
         await route.abort('blockedbyclient');
       }
     });
@@ -335,15 +416,40 @@ export async function runCaptureJob(
     let fatalLimitError: CaptureError | null = null;
     const pendingAssetReads: Promise<void>[] = [];
 
+    page.on('requestfailed', (req: PwRequest) => {
+      if (abortController.signal.aborted) return;
+      const reqUrl = req.url();
+      if (intentionallyBlockedUrls.has(reqUrl)) return;
+      if (!reqUrl.startsWith('http://') && !reqUrl.startsWith('https://')) return;
+      recordFailedResource({
+        url: reqUrl,
+        resourceType: req.resourceType(),
+        reason: req.failure()?.errorText || 'Network request failed',
+      });
+    });
+
     page.on('response', (response: PwResponse) => {
       const task = (async () => {
         try {
           if (fatalLimitError || abortController.signal.aborted) return;
 
           const status = response.status();
-          if (status < 200 || status >= 300) return;
-
           const resUrl = response.url();
+          const resourceType = response.request().resourceType();
+
+          if (status >= 400) {
+            if (resUrl.startsWith('http://') || resUrl.startsWith('https://')) {
+              recordFailedResource({
+                url: resUrl,
+                resourceType,
+                status,
+                reason: `HTTP ${status} ${response.statusText() || ''}`.trim(),
+              });
+            }
+            return;
+          }
+
+          if (status < 200 || status >= 300) return;
           if (!resUrl.startsWith('http://') && !resUrl.startsWith('https://')) return;
 
           // Verify actual remote peer IP (defends against DNS rebinding)
@@ -370,9 +476,11 @@ export async function runCaptureJob(
 
           const headers = response.headers();
           const contentType = headers['content-type'] || '';
-          const resourceType = response.request().resourceType();
           const category = classifyAsset(resUrl, contentType, resourceType);
           if (!category) return;
+
+          if (!job.options.includeImages && category === 'images') return;
+          if (!job.options.includeFonts && category === 'fonts') return;
 
           const body = await response.body().catch(() => null);
           if (!body || body.length === 0) return;
@@ -408,6 +516,12 @@ export async function runCaptureJob(
             buffer: body,
           });
 
+          if (category === 'css') stats.cssCount += 1;
+          else if (category === 'js') stats.jsCount += 1;
+          else if (category === 'images') stats.imagesCount += 1;
+          else if (category === 'fonts') stats.fontsCount += 1;
+          else stats.otherAssetsCount += 1;
+
           stats.assetsCaptured = assets.size;
           stats.totalBytes = totalBytes;
         } catch {
@@ -422,6 +536,8 @@ export async function runCaptureJob(
     const maxDepth = Math.max(0, Math.min(3, job.options.crawlDepth || 0));
     const visitedPages = new Set<string>();
     const queue: Array<{ url: string; depth: number }> = [{ url: entryUrl.toString(), depth: 0 }];
+
+    await fs.mkdir(job.siteDir, { recursive: true });
 
     while (queue.length > 0 && pages.length < maxPages) {
       checkAborted();
@@ -442,19 +558,19 @@ export async function runCaptureJob(
       emit(
         'capturing',
         pages.length === 0
-          ? `Capturing ${currentParsed.hostname}...`
-          : `Capturing page ${pages.length + 1} of ${maxPages}: ${currentParsed.pathname}`,
+          ? `Loading ${currentParsed.hostname} and downloading assets...`
+          : `Crawling page ${pages.length + 1} of ${maxPages}: ${currentParsed.pathname}`,
         progressPct,
         current.url,
       );
 
+      let mainResponse: PwResponse | null = null;
       try {
-        await page.goto(current.url, {
+        mainResponse = await page.goto(current.url, {
           waitUntil: 'networkidle',
           timeout: 22000,
         });
       } catch (err) {
-        // If networkidle timed out on a page with polling/analytics, check if DOM loaded
         const readyState = await page.evaluate(() => document.readyState).catch(() => '');
         if (!readyState || (readyState !== 'interactive' && readyState !== 'complete')) {
           if (pages.length === 0) {
@@ -465,6 +581,20 @@ export async function runCaptureJob(
           }
           continue;
         }
+      }
+
+      if (pages.length === 0 && mainResponse && mainResponse.status() >= 400) {
+        const status = mainResponse.status();
+        if (status === 403 || status === 401) {
+          throw new CaptureError(
+            'NAVIGATION_ERROR',
+            `Target site returned HTTP ${status}. Its CDN, firewall, or bot protection may be blocking cloud server IPs, or the page requires login.`,
+          );
+        }
+        throw new CaptureError(
+          'NAVIGATION_ERROR',
+          `Target site returned HTTP ${status} (${mainResponse.statusText() || 'Error'}).`,
+        );
       }
 
       checkAborted();
@@ -486,10 +616,69 @@ export async function runCaptureJob(
       });
 
       await page.waitForLoadState('networkidle', { timeout: 3500 }).catch(() => {});
+      await new Promise((r) => setTimeout(r, 250));
       await Promise.allSettled(pendingAssetReads.splice(0));
 
       checkAborted();
       if (fatalLimitError) throw fatalLimitError;
+
+      const localRelPath = buildPageRelPath(current.url, entryNormalized, usedPaths);
+
+      // Capture comparison screenshot of entry page (stored in tempRoot for Original vs. Captured view)
+      if (pages.length === 0) {
+        try {
+          await page.screenshot({
+            path: job.originalScreenshotPath,
+            fullPage: false,
+            type: 'png',
+          });
+          job.hasOriginalScreenshot = true;
+        } catch {
+          job.hasOriginalScreenshot = false;
+        }
+      }
+
+      // Optionally save full-page screenshots into exported project
+      if (job.options.saveScreenshots) {
+        try {
+          const shotRel = `screenshots/${localRelPath.replace(/\.html$/i, '').replace(/\//g, '_')}.png`;
+          const shotDest = path.resolve(job.siteDir, shotRel);
+          if (shotDest.startsWith(job.siteDir + path.sep)) {
+            const shotBuf = await page.screenshot({ fullPage: true, type: 'png' });
+            if (consumeBudget(shotBuf.length, 1)) {
+              await fs.mkdir(path.dirname(shotDest), { recursive: true });
+              await fs.writeFile(shotDest, shotBuf);
+              stats.screenshotsCount += 1;
+            }
+          }
+        } catch {
+          // Non-fatal screenshot error
+        }
+      }
+
+      // Inspect broken images in the rendered DOM
+      if (job.options.includeImages) {
+        const pageBrokenImgs = await page
+          .evaluate(() => {
+            return Array.from(document.querySelectorAll('img'))
+              .filter((img) => {
+                const src = img.getAttribute('src') || img.getAttribute('data-src') || '';
+                if (!src) return false;
+                return !img.complete || img.naturalWidth === 0;
+              })
+              .map((img) => ({
+                src: img.getAttribute('src') || img.getAttribute('data-src') || '',
+                reason: !img.complete ? 'Image did not finish loading' : 'Image decoded with zero width (broken or blocked)',
+              }));
+          })
+          .catch(() => []);
+
+        for (const bImg of pageBrokenImgs) {
+          if (brokenImages.length < 50) {
+            brokenImages.push({ ...bImg, page: localRelPath });
+          }
+        }
+      }
 
       const html = await page.content();
       const title = (await page.title().catch(() => '')) || currentParsed.hostname;
@@ -502,7 +691,6 @@ export async function runCaptureJob(
         throw new CaptureError('SIZE_LIMIT_EXCEEDED', 'Site exceeds 100 MB capture limit.');
       }
 
-      const localRelPath = buildPageRelPath(current.url, entryNormalized, usedPaths);
       pages.push({
         originalUrl: finalPageUrl,
         normalizedUrl: normCurrent,
@@ -515,17 +703,24 @@ export async function runCaptureJob(
         job.siteTitle = title;
       }
       stats.pagesCaptured = pages.length;
+      stats.htmlCount = pages.length;
 
       // Enqueue internal links if within depth limit
       if (current.depth < maxDepth && pages.length < maxPages) {
         const hrefs = await page.evaluate(() =>
-          Array.from(document.querySelectorAll('a[href]')).map((a) =>
-            (a as HTMLAnchorElement).getAttribute('href') || '',
+          Array.from(document.querySelectorAll('a[href]')).map(
+            (a) => (a as HTMLAnchorElement).getAttribute('href') || '',
           ),
         );
 
         for (const rawHref of hrefs) {
-          if (!rawHref || rawHref.startsWith('#') || rawHref.startsWith('mailto:') || rawHref.startsWith('tel:') || rawHref.startsWith('javascript:')) {
+          if (
+            !rawHref ||
+            rawHref.startsWith('#') ||
+            rawHref.startsWith('mailto:') ||
+            rawHref.startsWith('tel:') ||
+            rawHref.startsWith('javascript:')
+          ) {
             continue;
           }
           try {
@@ -551,7 +746,6 @@ export async function runCaptureJob(
       throw new CaptureError('NAVIGATION_ERROR', 'No pages could be captured from this URL.');
     }
 
-    // Close browser right after capture completes so Chromium memory is freed immediately
     await context.close().catch(() => {});
     context = null;
     await browser.close().catch(() => {});
@@ -590,9 +784,6 @@ export async function runCaptureJob(
     // 7. Rewrite URLs in CSS, JS, HTML and optionally format with Prettier
     emit('rewriting', 'Rewriting asset paths to relative local references...', 74);
 
-    await fs.mkdir(job.siteDir, { recursive: true });
-
-    // Write & rewrite assets
     const assetList = Array.from(assets.values());
     for (let i = 0; i < assetList.length; i++) {
       checkAborted();
@@ -625,7 +816,6 @@ export async function runCaptureJob(
       emit('formatting', 'Formatting HTML, CSS, and JavaScript with Prettier...', 84);
     }
 
-    // Write & rewrite HTML pages
     for (const pg of pages) {
       checkAborted();
       const destPath = path.resolve(job.siteDir, pg.localRelPath);
@@ -633,22 +823,41 @@ export async function runCaptureJob(
 
       await fs.mkdir(path.dirname(destPath), { recursive: true });
 
-      let rewrittenHtml = rewriteHtmlDocument({
+      const rewritten = rewriteHtmlDocument({
         html: pg.html,
         pageOriginalUrl: pg.originalUrl,
         pageLocalRelPath: pg.localRelPath,
         assetPathMap,
         pagePathMap,
+        preserveInternalNav: job.options.preserveInternalNav,
       });
 
-      if (job.options.formatCode) {
-        rewrittenHtml = await formatCapturedCode(rewrittenHtml, 'html');
+      for (const item of rewritten.unresolvedLinks) {
+        if (unresolvedLinks.length < 100) {
+          unresolvedLinks.push(item);
+        }
       }
 
-      await fs.writeFile(destPath, rewrittenHtml, 'utf8');
+      let finalHtml = rewritten.html;
+      if (job.options.formatCode) {
+        finalHtml = await formatCapturedCode(finalHtml, 'html');
+      }
+
+      await fs.writeFile(destPath, finalHtml, 'utf8');
     }
 
-    // 8. Generate README.md inside captured folder
+    stats.durationMs = Math.max(1, Date.now() - startTime);
+
+    // 8. Generate package.json (when JS or recovered sources exist) & README.md
+    let hasPackageJson = false;
+    if (stats.jsCount > 0 || stats.sourceMapsRecovered > 0) {
+      hasPackageJson = await writeArchivePackageJson({
+        siteDir: job.siteDir,
+        hostname: job.hostname,
+        siteTitle: job.siteTitle,
+      });
+    }
+
     await writeArchiveReadme({
       siteDir: job.siteDir,
       targetUrl: job.url,
@@ -656,16 +865,30 @@ export async function runCaptureJob(
       stats,
       formatted: job.options.formatCode,
       recoveredSourceMaps: job.options.recoverSourceMaps,
+      hasPackageJson,
     });
 
     checkAborted();
 
-    // 9. Zip folder
-    emit('zipping', 'Compressing site archive into ZIP package...', 93);
-    const zipBytes = await createZipArchive(job.siteDir, job.zipPath);
-    stats.zipBytes = zipBytes;
+    // Populate diagnostics & generated folder contents
+    job.diagnostics = {
+      brokenImages,
+      failedResources,
+      unresolvedLinks,
+    };
+    job.files = await listDirectoryFiles(job.siteDir);
 
-    emit('ready', 'Snapshot complete and ready for preview or download.', 100);
+    // 9. Zip folder inside a clean named root directory
+    emit('zipping', 'Compressing site archive into VS Code-ready ZIP...', 93);
+    const rootFolderName = path.basename(job.zipFilename, '.zip') || `sitegrab-${job.hostname}`;
+    const zipBytes = await createZipArchive(job.siteDir, job.zipPath, rootFolderName);
+    if (!zipBytes || zipBytes <= 0) {
+      throw new CaptureError('CAPTURE_FAILED', 'Generated ZIP archive was empty.');
+    }
+    stats.zipBytes = zipBytes;
+    stats.durationMs = Math.max(1, Date.now() - startTime);
+
+    emit('ready', 'Snapshot complete and ready for preview, AI inspection, or download.', 100);
   } catch (err) {
     if (err instanceof CaptureError) {
       throw err;

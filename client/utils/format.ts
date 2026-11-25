@@ -7,6 +7,12 @@ export function formatBytes(bytes: number): string {
   return `${mb.toFixed(2)} MB`;
 }
 
+export function formatDurationMs(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '0.0s';
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
 export function formatRelativeTime(timestamp: number): string {
   const diffSec = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
   if (diffSec < 60) return 'Just now';
@@ -30,6 +36,8 @@ export function getFriendlyErrorTitle(errorCode?: string): string {
       return 'Domain Could Not Be Resolved';
     case 'ROBOTS_DISALLOWED':
       return 'Blocked by robots.txt';
+    case 'MISSING_CHROMIUM':
+      return 'Chromium Browser Not Installed';
     case 'SIZE_LIMIT_EXCEEDED':
       return 'Site Exceeds 100 MB Limit';
     case 'FILE_LIMIT_EXCEEDED':

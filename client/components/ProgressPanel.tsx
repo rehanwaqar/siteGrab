@@ -8,13 +8,13 @@ interface ProgressPanelProps {
 }
 
 const ORDERED_STAGES: Array<{ key: CaptureStage; label: string }> = [
-  { key: 'validating', label: 'Validate URL & robots.txt' },
-  { key: 'launching', label: 'Launch browser' },
-  { key: 'capturing', label: 'Capture pages & assets' },
-  { key: 'recovering', label: 'Recover source maps' },
+  { key: 'validating', label: 'Validate URL & robots' },
+  { key: 'launching', label: 'Browser launch' },
+  { key: 'capturing', label: 'Page load, crawl & assets' },
+  { key: 'recovering', label: 'Source maps' },
   { key: 'rewriting', label: 'Rewrite paths' },
   { key: 'formatting', label: 'Format code' },
-  { key: 'zipping', label: 'Create ZIP' },
+  { key: 'zipping', label: 'Package ZIP' },
 ];
 
 const STAGE_RANK: Record<CaptureStage, number> = {
@@ -76,6 +76,8 @@ export function ProgressPanel({ event, targetHostname }: ProgressPanelProps) {
         <span>Assets: {event.stats.assetsCaptured}</span>
         <span aria-hidden="true" className="text-slate-300 dark:text-slate-700">·</span>
         <span>Captured: {formatBytes(event.stats.totalBytes)}</span>
+        <span aria-hidden="true" className="text-slate-300 dark:text-slate-700">·</span>
+        <span>Failed: {event.stats.failedAssetsCount}</span>
         <span aria-hidden="true" className="text-slate-300 dark:text-slate-700">·</span>
         <span>Source maps: {event.stats.sourceMapsRecovered}</span>
       </div>

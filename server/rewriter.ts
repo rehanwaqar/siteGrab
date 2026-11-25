@@ -112,9 +112,22 @@ export function rewriteHtmlDocument(options: {
   pageLocalRelPath: string;
   assetPathMap: Map<string, string>;
   pagePathMap: Map<string, string>;
-}): string {
-  const { html, pageOriginalUrl, pageLocalRelPath, assetPathMap, pagePathMap } = options;
+  preserveInternalNav?: boolean;
+}): {
+  html: string;
+  unresolvedLinks: Array<{ href: string; page: string; type: 'asset' | 'navigation' }>;
+} {
+  const {
+    html,
+    pageOriginalUrl,
+    pageLocalRelPath,
+    assetPathMap,
+    pagePathMap,
+    preserveInternalNav = true,
+  } = options;
   const $ = cheerio.load(html);
+  const unresolvedLinks: Array<{ href: string; page: string; type: 'asset' | 'navigation' }> = [];
+  const seenUnresolved = new Set<string>();
 
   // Respect <base href="..."> if present when resolving relative URLs, then remove it
   const baseEl = $('base[href]').first();
@@ -152,6 +165,23 @@ export function rewriteHtmlDocument(options: {
     $(selector).each((_, el) => {
       const val = $(el).attr(attr);
       if (!val) return;
+      const trimmed = val.trim();
+      if (
+        !trimmed ||
+        trimmed.startsWith('data:') ||
+        trimmed.startsWith('blob:') ||
+        trimmed.startsWith('javascript:') ||
+        trimmed.startsWith('mailto:') ||
+        trimmed.startsWith('tel:') ||
+        trimmed.startsWith('#')
+      ) {
+        return;
+      }
+
+      if (includePages && !preserveInternalNav) {
+        return;
+      }
+
       const rewritten = resolveToLocalPath(
         val,
         effectiveBase,
@@ -164,6 +194,26 @@ export function rewriteHtmlDocument(options: {
         // Ensure lazy-loaded data-src also hydrates src for static offline viewing
         if (attr === 'data-src' && !$(el).attr('src')) {
           $(el).attr('src', rewritten);
+        }
+      } else if (unresolvedLinks.length < 100) {
+        // Ignore non-rendered link rels like canonical/preconnect/alternate
+        const tag = ('tagName' in el ? el.tagName?.toLowerCase() : '') || '';
+        const rel = ($(el).attr('rel') || '').toLowerCase();
+        if (
+          tag === 'link' &&
+          (rel.includes('canonical') ||
+            rel.includes('preconnect') ||
+            rel.includes('dns-prefetch') ||
+            rel.includes('alternate') ||
+            rel.includes('manifest'))
+        ) {
+          return;
+        }
+        const type = includePages ? 'navigation' : 'asset';
+        const dedupeKey = `${type}:${trimmed}`;
+        if (!seenUnresolved.has(dedupeKey)) {
+          seenUnresolved.add(dedupeKey);
+          unresolvedLinks.push({ href: trimmed, page: pageLocalRelPath, type });
         }
       }
     });
@@ -202,7 +252,7 @@ export function rewriteHtmlDocument(options: {
     $(el).html(rewriteCssUrls(css, effectiveBase, pageLocalRelPath, assetPathMap));
   });
 
-  return $.html();
+  return { html: $.html(), unresolvedLinks };
 }
 
 export function rewriteJsUrls(

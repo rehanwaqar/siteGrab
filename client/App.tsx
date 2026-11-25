@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import {
   AlertTriangle,
   Download,
@@ -12,12 +12,32 @@ import {
 import { HistoryView } from './components/HistoryView';
 import { PreviewPanel } from './components/PreviewPanel';
 import { ProgressPanel } from './components/ProgressPanel';
+import { ResultsDashboard } from './components/ResultsDashboard';
 import { TermsView } from './components/TermsView';
-import type { ActiveView, HistoryEntry, ProgressEvent } from './types';
-import { formatBytes, formatRelativeTime, getFriendlyErrorTitle } from './utils/format';
+import type {
+  ActiveView,
+  CapturedFileEntry,
+  CaptureOptions,
+  CaptureStats,
+  DiagnosticReport,
+  HistoryEntry,
+  ProgressEvent,
+} from './types';
+import {
+  formatBytes,
+  formatDurationMs,
+  formatRelativeTime,
+  getFriendlyErrorTitle,
+} from './utils/format';
 
 const HISTORY_STORAGE_KEY = 'sitegrab_history_v1';
 const THEME_STORAGE_KEY = 'sitegrab_theme_v1';
+
+const EMPTY_DIAGNOSTICS: DiagnosticReport = {
+  brokenImages: [],
+  failedResources: [],
+  unresolvedLinks: [],
+};
 
 function loadHistory(): HistoryEntry[] {
   try {
@@ -47,19 +67,33 @@ export default function App() {
   const [maxPages, setMaxPages] = useState<number>(5);
   const [formatCode, setFormatCode] = useState<boolean>(true);
   const [recoverSourceMaps, setRecoverSourceMaps] = useState<boolean>(true);
+  const [includeImages, setIncludeImages] = useState<boolean>(true);
+  const [includeFonts, setIncludeFonts] = useState<boolean>(true);
+  const [mobileViewport, setMobileViewport] = useState<boolean>(false);
+  const [saveScreenshots, setSaveScreenshots] = useState<boolean>(false);
+  const [preserveInternalNav, setPreserveInternalNav] = useState<boolean>(true);
+  const [autoDownload, setAutoDownload] = useState<boolean>(true);
 
+  const [chromiumMissing, setChromiumMissing] = useState<boolean>(false);
   const [isCapturing, setIsCapturing] = useState<boolean>(false);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [activeHostname, setActiveHostname] = useState<string>('');
   const [siteTitle, setSiteTitle] = useState<string>('');
   const [zipFilename, setZipFilename] = useState<string>('');
+  const [capturedFiles, setCapturedFiles] = useState<CapturedFileEntry[]>([]);
+  const [diagnostics, setDiagnostics] = useState<DiagnosticReport>(EMPTY_DIAGNOSTICS);
+  const [hasOriginalScreenshot, setHasOriginalScreenshot] = useState<boolean>(false);
   const [progressEvent, setProgressEvent] = useState<ProgressEvent | null>(null);
   const [errorState, setErrorState] = useState<{ code?: string; message: string } | null>(null);
-  const [downloaded, setDownloaded] = useState<boolean>(false);
+  const [isDownloading, setIsDownloading] = useState<boolean>(false);
+  const [downloadComplete, setDownloadComplete] = useState<boolean>(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
 
   const [history, setHistory] = useState<HistoryEntry[]>(loadHistory);
 
   const eventSourceRef = useRef<EventSource | null>(null);
+  const autoDownloadRef = useRef<boolean>(autoDownload);
+  autoDownloadRef.current = autoDownload;
 
   useEffect(() => {
     const root = document.documentElement;
@@ -84,6 +118,15 @@ export default function App() {
   }, [history]);
 
   useEffect(() => {
+    fetch('/api/health')
+      .then((r) => r.json())
+      .then((d: { chromiumInstalled?: boolean }) => {
+        if (d && d.chromiumInstalled === false) {
+          setChromiumMissing(true);
+        }
+      })
+      .catch(() => {});
+
     return () => {
       eventSourceRef.current?.close();
     };
@@ -96,25 +139,89 @@ export default function App() {
     }
   };
 
-  const recordHistoryEntry = async (jobId: string, event: ProgressEvent, targetUrl: string, host: string) => {
+  const downloadZipByJobId = useCallback(async (jobId: string, filename: string): Promise<boolean> => {
+    setIsDownloading(true);
+    setDownloadError(null);
+    try {
+      const res = await fetch(`/api/capture/${encodeURIComponent(jobId)}/download`, {
+        cache: 'no-store',
+      });
+      if (!res.ok) {
+        let errMsg = `Download failed (HTTP ${res.status}).`;
+        try {
+          const errJson = (await res.json()) as { error?: string };
+          if (errJson.error) errMsg = errJson.error;
+        } catch {
+          // Keep HTTP status message
+        }
+        setDownloadError(errMsg);
+        return false;
+      }
+
+      const blob = await res.blob();
+      if (!blob || blob.size === 0) {
+        setDownloadError('Received an empty ZIP archive from the server. Please recapture the site.');
+        return false;
+      }
+
+      const blobUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = filename || 'sitegrab-archive.zip';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 15_000);
+      setDownloadComplete(true);
+      return true;
+    } catch {
+      setDownloadError('Network error while downloading the ZIP archive. Please click Download ZIP again.');
+      return false;
+    } finally {
+      setIsDownloading(false);
+    }
+  }, []);
+
+  const finalizeCapture = async (
+    jobId: string,
+    event: ProgressEvent,
+    targetUrl: string,
+    host: string,
+    usedOptions: Omit<CaptureOptions, 'url'>,
+  ) => {
     let resolvedTitle = host;
     let resolvedZip = `sitegrab-${host}.zip`;
+    let resolvedFiles: CapturedFileEntry[] = event.files ?? [];
+    let resolvedDiagnostics: DiagnosticReport = event.diagnostics ?? EMPTY_DIAGNOSTICS;
+    let resolvedHasShot = Boolean(event.hasOriginalScreenshot);
+
     try {
       const statusRes = await fetch(`/api/capture/${encodeURIComponent(jobId)}/status`);
       if (statusRes.ok) {
         const statusData = (await statusRes.json()) as {
           siteTitle?: string;
           zipFilename?: string;
+          files?: CapturedFileEntry[];
+          diagnostics?: DiagnosticReport;
+          hasOriginalScreenshot?: boolean;
         };
         if (statusData.siteTitle) resolvedTitle = statusData.siteTitle;
         if (statusData.zipFilename) resolvedZip = statusData.zipFilename;
+        if (Array.isArray(statusData.files)) resolvedFiles = statusData.files;
+        if (statusData.diagnostics) resolvedDiagnostics = statusData.diagnostics;
+        if (typeof statusData.hasOriginalScreenshot === 'boolean') {
+          resolvedHasShot = statusData.hasOriginalScreenshot;
+        }
       }
     } catch {
-      // Fall back to hostname
+      // Fall back to SSE event payload
     }
 
     setSiteTitle(resolvedTitle);
     setZipFilename(resolvedZip);
+    setCapturedFiles(resolvedFiles);
+    setDiagnostics(resolvedDiagnostics);
+    setHasOriginalScreenshot(resolvedHasShot);
 
     const newEntry: HistoryEntry = {
       id: jobId,
@@ -124,143 +231,214 @@ export default function App() {
       zipFilename: resolvedZip,
       capturedAt: Date.now(),
       stats: event.stats,
-      options: {
-        crawlDepth,
-        maxPages,
-        formatCode,
-        recoverSourceMaps,
-      },
+      options: usedOptions,
     };
 
     setHistory((prev) => [newEntry, ...prev.filter((item) => item.id !== jobId)].slice(0, 15));
+
+    if (autoDownloadRef.current) {
+      await downloadZipByJobId(jobId, resolvedZip);
+    }
   };
 
-  const handleStartCapture = async (e: FormEvent) => {
-    e.preventDefault();
-    const trimmed = urlInput.trim();
-    if (!trimmed) {
-      setErrorState({ code: 'INVALID_URL', message: 'Please enter a valid http:// or https:// URL.' });
-      return;
-    }
-
-    // Auto-prepend https:// only if user omitted scheme, while validating clearly
-    const normalizedInput = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed)
-      ? trimmed
-      : `https://${trimmed}`;
-
-    closeActiveStream();
-    setErrorState(null);
-    setProgressEvent(null);
-    setActiveJobId(null);
-    setDownloaded(false);
-    setIsCapturing(true);
-
-    try {
-      const response = await fetch('/api/capture', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          url: normalizedInput,
-          crawlDepth,
-          maxPages: crawlDepth > 0 ? maxPages : 1,
-          formatCode,
-          recoverSourceMaps,
-        }),
-      });
-
-      const data = (await response.json()) as {
-        jobId?: string;
-        url?: string;
-        hostname?: string;
-        error?: string;
-        errorCode?: string;
-      };
-
-      if (!response.ok || !data.jobId) {
-        setIsCapturing(false);
+  const executeCapture = useCallback(
+    async (rawTargetUrl: string, customOptions?: Omit<CaptureOptions, 'url'>) => {
+      const trimmed = rawTargetUrl.trim();
+      if (!trimmed) {
         setErrorState({
-          code: data.errorCode || (response.status === 429 ? 'RATE_LIMITED' : 'CAPTURE_FAILED'),
-          message: data.error || 'Could not start capture job.',
+          code: 'INVALID_URL',
+          message: 'Please enter a valid http:// or https:// URL.',
         });
         return;
       }
 
-      const jobId = data.jobId;
-      const host = data.hostname || '';
-      const resolvedUrl = data.url || normalizedInput;
-      setUrlInput(resolvedUrl);
-      setActiveJobId(jobId);
-      setActiveHostname(host);
-      setSiteTitle(host);
-      setZipFilename(`sitegrab-${host}.zip`);
+      const normalizedInput = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed)
+        ? trimmed
+        : `https://${trimmed}`;
 
-      const es = new EventSource(`/api/capture/${encodeURIComponent(jobId)}/events`);
-      eventSourceRef.current = es;
+      const opts: Omit<CaptureOptions, 'url'> = customOptions ?? {
+        crawlDepth,
+        maxPages: crawlDepth > 0 ? maxPages : 1,
+        formatCode,
+        recoverSourceMaps,
+        includeImages,
+        includeFonts,
+        mobileViewport,
+        saveScreenshots,
+        preserveInternalNav,
+      };
 
-      es.onmessage = (msg) => {
-        try {
-          const evt = JSON.parse(msg.data) as ProgressEvent;
-          setProgressEvent(evt);
+      closeActiveStream();
+      setErrorState(null);
+      setProgressEvent(null);
+      setActiveJobId(null);
+      setCapturedFiles([]);
+      setDiagnostics(EMPTY_DIAGNOSTICS);
+      setHasOriginalScreenshot(false);
+      setDownloadComplete(false);
+      setDownloadError(null);
+      setIsCapturing(true);
 
-          if (evt.stage === 'ready') {
-            es.close();
-            eventSourceRef.current = null;
-            setIsCapturing(false);
-            void recordHistoryEntry(jobId, evt, resolvedUrl, host);
-          } else if (evt.stage === 'error') {
-            es.close();
-            eventSourceRef.current = null;
-            setIsCapturing(false);
-            setErrorState({
-              code: evt.errorCode,
-              message: evt.message,
-            });
-          }
-        } catch {
-          // Ignore malformed event
+      try {
+        const response = await fetch('/api/capture', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            url: normalizedInput,
+            ...opts,
+          }),
+        });
+
+        const data = (await response.json()) as {
+          jobId?: string;
+          url?: string;
+          hostname?: string;
+          error?: string;
+          errorCode?: string;
+        };
+
+        if (!response.ok || !data.jobId) {
+          setIsCapturing(false);
+          setErrorState({
+            code: data.errorCode || (response.status === 429 ? 'RATE_LIMITED' : 'CAPTURE_FAILED'),
+            message: data.error || 'Could not start capture job.',
+          });
+          return;
         }
-      };
 
-      es.onerror = () => {
-        if (es.readyState === EventSource.CLOSED) return;
-        es.close();
-        eventSourceRef.current = null;
+        const jobId = data.jobId;
+        const host = data.hostname || '';
+        const resolvedUrl = data.url || normalizedInput;
+        setUrlInput(resolvedUrl);
+        setActiveJobId(jobId);
+        setActiveHostname(host);
+        setSiteTitle(host);
+        setZipFilename(`sitegrab-${host}.zip`);
+
+        const es = new EventSource(`/api/capture/${encodeURIComponent(jobId)}/events`);
+        eventSourceRef.current = es;
+
+        es.onmessage = (msg) => {
+          try {
+            const evt = JSON.parse(msg.data) as ProgressEvent;
+            setProgressEvent(evt);
+
+            if (evt.stage === 'ready') {
+              es.close();
+              eventSourceRef.current = null;
+              setIsCapturing(false);
+              void finalizeCapture(jobId, evt, resolvedUrl, host, opts);
+            } else if (evt.stage === 'error') {
+              es.close();
+              eventSourceRef.current = null;
+              setIsCapturing(false);
+              setErrorState({
+                code: evt.errorCode,
+                message: evt.message,
+              });
+            }
+          } catch {
+            // Ignore malformed event
+          }
+        };
+
+        es.onerror = () => {
+          if (es.readyState === EventSource.CLOSED) return;
+          es.close();
+          eventSourceRef.current = null;
+          setIsCapturing(false);
+          setErrorState((prev) =>
+            prev ?? {
+              code: 'CONNECTION_LOST',
+              message: 'Lost live progress connection. Click Retry to try again.',
+            },
+          );
+        };
+      } catch {
         setIsCapturing(false);
-        setErrorState((prev) =>
-          prev ?? {
-            code: 'CONNECTION_LOST',
-            message: 'Lost live progress connection. Check the URL and try again.',
-          },
-        );
-      };
-    } catch {
-      setIsCapturing(false);
+        setErrorState({
+          code: 'NETWORK_ERROR',
+          message: 'Could not reach the SiteGrab server. Please check your connection and retry.',
+        });
+      }
+    },
+    [
+      crawlDepth,
+      maxPages,
+      formatCode,
+      recoverSourceMaps,
+      includeImages,
+      includeFonts,
+      mobileViewport,
+      saveScreenshots,
+      preserveInternalNav,
+    ],
+  );
+
+  const handleStartCapture = (e: FormEvent) => {
+    e.preventDefault();
+    void executeCapture(urlInput);
+  };
+
+  const handleLoadFromHistory = (entry: HistoryEntry, autoRun = false) => {
+    const restoredOpts: Omit<CaptureOptions, 'url'> = {
+      crawlDepth: entry.options.crawlDepth ?? 0,
+      maxPages: entry.options.maxPages ?? 5,
+      formatCode: entry.options.formatCode ?? true,
+      recoverSourceMaps: entry.options.recoverSourceMaps ?? true,
+      includeImages: entry.options.includeImages ?? true,
+      includeFonts: entry.options.includeFonts ?? true,
+      mobileViewport: entry.options.mobileViewport ?? false,
+      saveScreenshots: entry.options.saveScreenshots ?? false,
+      preserveInternalNav: entry.options.preserveInternalNav ?? true,
+    };
+
+    setUrlInput(entry.url);
+    setCrawlDepth(restoredOpts.crawlDepth);
+    setMaxPages(restoredOpts.maxPages);
+    setFormatCode(restoredOpts.formatCode);
+    setRecoverSourceMaps(restoredOpts.recoverSourceMaps);
+    setIncludeImages(restoredOpts.includeImages);
+    setIncludeFonts(restoredOpts.includeFonts);
+    setMobileViewport(restoredOpts.mobileViewport);
+    setSaveScreenshots(restoredOpts.saveScreenshots);
+    setPreserveInternalNav(restoredOpts.preserveInternalNav);
+    setErrorState(null);
+    setActiveView('capture');
+
+    if (autoRun) {
+      void executeCapture(entry.url, restoredOpts);
+    }
+  };
+
+  const handleDownloadFromHistory = async (entry: HistoryEntry) => {
+    const ok = await downloadZipByJobId(entry.id, entry.zipFilename);
+    if (!ok) {
+      // Server archive expired after TTL — load in Capture tab and show friendly prompt to recapture
+      handleLoadFromHistory(entry, false);
       setErrorState({
-        code: 'NETWORK_ERROR',
-        message: 'Could not reach the SiteGrab server. Please try again.',
+        code: 'EXPIRED',
+        message: `The temporary server archive for ${entry.hostname} has expired. Click Retry Capture to regenerate it with your saved settings.`,
       });
     }
   };
 
-  const handleDownloadZip = () => {
-    if (!activeJobId || downloaded) return;
-    const link = document.createElement('a');
-    link.href = `/api/capture/${encodeURIComponent(activeJobId)}/download`;
-    link.download = zipFilename || 'sitegrab-archive.zip';
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    setDownloaded(true);
-  };
-
-  const handleLoadFromHistory = (entry: HistoryEntry) => {
-    setUrlInput(entry.url);
-    setCrawlDepth(entry.options.crawlDepth);
-    setMaxPages(entry.options.maxPages);
-    setFormatCode(entry.options.formatCode);
-    setRecoverSourceMaps(entry.options.recoverSourceMaps);
-    setErrorState(null);
-    setActiveView('capture');
+  const handleWorkspaceUpdated = (payload: {
+    files: CapturedFileEntry[];
+    stats: CaptureStats;
+    appliedFiles: string[];
+  }) => {
+    setCapturedFiles(payload.files);
+    setDownloadComplete(false);
+    setProgressEvent((prev) =>
+      prev
+        ? {
+            ...prev,
+            stats: payload.stats,
+            files: payload.files,
+          }
+        : prev,
+    );
   };
 
   return (
@@ -330,11 +508,12 @@ export default function App() {
       </header>
 
       {/* Main Content */}
-      <main className="flex-1 px-4 sm:px-6 py-10 sm:py-14">
+      <main className="flex-1 px-4 sm:px-6 py-10 sm:py-12">
         {activeView === 'history' && (
           <HistoryView
             history={history}
             onRecapture={handleLoadFromHistory}
+            onDownloadHistoryEntry={(entry) => void handleDownloadFromHistory(entry)}
             onClearHistory={() => setHistory([])}
             onSwitchToCapture={() => setActiveView('capture')}
           />
@@ -345,17 +524,30 @@ export default function App() {
         )}
 
         {activeView === 'capture' && (
-          <div className="mx-auto max-w-4xl space-y-8">
+          <div className="mx-auto max-w-5xl space-y-6">
+            {chromiumMissing && (
+              <section
+                role="alert"
+                className="rounded-xl border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/30 px-5 py-3.5 text-xs text-amber-800 dark:text-amber-300 flex items-center gap-2.5"
+              >
+                <AlertTriangle className="h-4 w-4 shrink-0" />
+                <span>
+                  Headless Chromium binary was not detected on the server. Install it with{' '}
+                  <code className="font-mono font-semibold">npx playwright install chromium</code> before capturing.
+                </span>
+              </section>
+            )}
+
             {/* Hero & Centered URL Input */}
             <section className="text-center">
               <h1
                 style={{ textWrap: 'balance' }}
                 className="font-display text-3xl sm:text-4xl font-bold tracking-tight text-slate-900 dark:text-slate-100"
               >
-                Download any site you own as an offline VS Code project
+                Website capture & offline development studio
               </h1>
               <p className="mx-auto mt-3 max-w-2xl text-sm sm:text-base text-slate-600 dark:text-slate-400 leading-relaxed">
-                Renders with headless Chromium, rewrites asset URLs to local relative paths, formats HTML/CSS/JS with Prettier, and recovers published source maps.
+                Capture websites you own with headless Chromium, inspect diagnostics and source files, edit with AI assistance, and export a VS Code-ready ZIP.
               </p>
 
               {/* URL Form */}
@@ -401,7 +593,7 @@ export default function App() {
               </form>
             </section>
 
-            {/* Capture Options Panel */}
+            {/* Advanced Capture Options Panel */}
             <section
               aria-label="Capture options"
               className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 sm:p-6"
@@ -416,12 +608,12 @@ export default function App() {
                 </span>
               </div>
 
-              <div className="mt-5 grid grid-cols-1 md:grid-cols-3 gap-6">
-                {/* Crawl Depth + Max Pages */}
-                <div className="space-y-2.5">
+              {/* Row 1: Crawl & Export Pipeline */}
+              <div className="mt-5 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                <div className="space-y-2 md:col-span-2 lg:col-span-1">
                   <div className="flex items-center justify-between">
                     <label className="text-xs font-medium text-slate-700 dark:text-slate-300">
-                      Multi-Page Crawl Depth
+                      Crawl Depth
                     </label>
                     {crawlDepth > 0 && (
                       <label className="flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400">
@@ -449,9 +641,9 @@ export default function App() {
                   >
                     {[
                       { value: 0, label: 'Single' },
-                      { value: 1, label: 'Depth 1' },
-                      { value: 2, label: 'Depth 2' },
-                      { value: 3, label: 'Depth 3' },
+                      { value: 1, label: 'D1' },
+                      { value: 2, label: 'D2' },
+                      { value: 3, label: 'D3' },
                     ].map((opt) => (
                       <button
                         key={opt.value}
@@ -470,14 +662,13 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Format Code Toggle */}
-                <label className="flex items-start justify-between gap-4 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-[#0B0F17]/60 p-3.5 cursor-pointer">
+                <label className="flex items-start justify-between gap-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-[#0B0F17]/60 p-3.5 cursor-pointer">
                   <div>
-                    <div className="text-sm font-medium text-slate-900 dark:text-slate-100">
+                    <div className="text-xs font-semibold text-slate-900 dark:text-slate-100">
                       Format Code
                     </div>
                     <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-                      Run Prettier on HTML, CSS, and JS files.
+                      Prettier HTML, CSS & JS.
                     </p>
                   </div>
                   <input
@@ -485,18 +676,17 @@ export default function App() {
                     checked={formatCode}
                     disabled={isCapturing}
                     onChange={(e) => setFormatCode(e.target.checked)}
-                    className="mt-1 h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                    className="mt-0.5 h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
                   />
                 </label>
 
-                {/* Recover Source Maps Toggle */}
-                <label className="flex items-start justify-between gap-4 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-[#0B0F17]/60 p-3.5 cursor-pointer">
+                <label className="flex items-start justify-between gap-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-[#0B0F17]/60 p-3.5 cursor-pointer">
                   <div>
-                    <div className="text-sm font-medium text-slate-900 dark:text-slate-100">
-                      Recover Source Maps
+                    <div className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+                      Source Maps
                     </div>
                     <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-                      Rebuild <code className="font-mono">/recovered-src</code> from published <code className="font-mono">.map</code> files.
+                      Recover <code className="font-mono">/recovered-src</code>.
                     </p>
                   </div>
                   <input
@@ -504,19 +694,105 @@ export default function App() {
                     checked={recoverSourceMaps}
                     disabled={isCapturing}
                     onChange={(e) => setRecoverSourceMaps(e.target.checked)}
-                    className="mt-1 h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                    className="mt-0.5 h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                  />
+                </label>
+
+                <label className="flex items-start justify-between gap-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-[#0B0F17]/60 p-3.5 cursor-pointer">
+                  <div>
+                    <div className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+                      Auto-Download
+                    </div>
+                    <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                      Save ZIP when ready.
+                    </p>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={autoDownload}
+                    disabled={isCapturing}
+                    onChange={(e) => setAutoDownload(e.target.checked)}
+                    className="mt-0.5 h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                  />
+                </label>
+              </div>
+
+              {/* Row 2: Asset & Viewport Controls */}
+              <div className="mt-3 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+                <label className="flex items-center justify-between gap-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-[#0B0F17]/40 px-3.5 py-2.5 cursor-pointer">
+                  <span className="text-xs font-medium text-slate-800 dark:text-slate-200">
+                    Include Images
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={includeImages}
+                    disabled={isCapturing}
+                    onChange={(e) => setIncludeImages(e.target.checked)}
+                    className="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                  />
+                </label>
+
+                <label className="flex items-center justify-between gap-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-[#0B0F17]/40 px-3.5 py-2.5 cursor-pointer">
+                  <span className="text-xs font-medium text-slate-800 dark:text-slate-200">
+                    Include Fonts
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={includeFonts}
+                    disabled={isCapturing}
+                    onChange={(e) => setIncludeFonts(e.target.checked)}
+                    className="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                  />
+                </label>
+
+                <label className="flex items-center justify-between gap-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-[#0B0F17]/40 px-3.5 py-2.5 cursor-pointer">
+                  <span className="text-xs font-medium text-slate-800 dark:text-slate-200">
+                    Mobile Viewport
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={mobileViewport}
+                    disabled={isCapturing}
+                    onChange={(e) => setMobileViewport(e.target.checked)}
+                    className="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                  />
+                </label>
+
+                <label className="flex items-center justify-between gap-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-[#0B0F17]/40 px-3.5 py-2.5 cursor-pointer">
+                  <span className="text-xs font-medium text-slate-800 dark:text-slate-200">
+                    Save Screenshots
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={saveScreenshots}
+                    disabled={isCapturing}
+                    onChange={(e) => setSaveScreenshots(e.target.checked)}
+                    className="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                  />
+                </label>
+
+                <label className="flex items-center justify-between gap-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-[#0B0F17]/40 px-3.5 py-2.5 cursor-pointer col-span-2 sm:col-span-1">
+                  <span className="text-xs font-medium text-slate-800 dark:text-slate-200">
+                    Internal Nav
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={preserveInternalNav}
+                    disabled={isCapturing}
+                    onChange={(e) => setPreserveInternalNav(e.target.checked)}
+                    className="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
                   />
                 </label>
               </div>
             </section>
 
-            {/* Friendly Error Banner */}
+            {/* Friendly Error Banner with Retry */}
             {errorState && (
               <section
                 role="alert"
                 className="rounded-xl border border-red-200 dark:border-red-900/60 bg-red-50/80 dark:bg-red-950/30 p-5"
               >
-                <div className="flex items-start gap-3">
+                <div className="flex flex-col sm:flex-row sm:items-start gap-3">
                   <ShieldAlert className="h-5 w-5 text-red-600 dark:text-red-400 shrink-0 mt-0.5" />
                   <div className="min-w-0 flex-1">
                     <h2 className="text-sm font-semibold text-red-900 dark:text-red-200">
@@ -526,13 +802,25 @@ export default function App() {
                       {errorState.message}
                     </p>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => setErrorState(null)}
-                    className="rounded-lg px-2.5 py-1 text-xs font-medium text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/40 transition-colors cursor-pointer"
-                  >
-                    Dismiss
-                  </button>
+                  <div className="flex items-center gap-2 shrink-0">
+                    {urlInput.trim() && (
+                      <button
+                        type="button"
+                        onClick={() => void executeCapture(urlInput)}
+                        className="inline-flex items-center gap-1.5 rounded-lg bg-red-600 hover:bg-red-500 px-3 py-1.5 text-xs font-semibold text-white transition-colors cursor-pointer"
+                      >
+                        <RotateCcw className="h-3.5 w-3.5" />
+                        <span>Retry Capture</span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setErrorState(null)}
+                      className="rounded-lg px-2.5 py-1.5 text-xs font-medium text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/40 transition-colors cursor-pointer"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
                 </div>
               </section>
             )}
@@ -542,17 +830,27 @@ export default function App() {
               <ProgressPanel event={progressEvent} targetHostname={activeHostname} />
             )}
 
-            {/* Live Preview & Download Panel */}
+            {/* Capture Results Dashboard + Preview / Files / Diagnostics / AI Workspace */}
             {progressEvent?.stage === 'ready' && activeJobId && (
-              <PreviewPanel
-                jobId={activeJobId}
-                siteTitle={siteTitle}
-                hostname={activeHostname}
-                zipFilename={zipFilename}
-                event={progressEvent}
-                downloaded={downloaded}
-                onDownload={handleDownloadZip}
-              />
+              <>
+                <ResultsDashboard stats={progressEvent.stats} hostname={activeHostname} />
+                <PreviewPanel
+                  jobId={activeJobId}
+                  siteTitle={siteTitle}
+                  hostname={activeHostname}
+                  zipFilename={zipFilename}
+                  event={progressEvent}
+                  files={capturedFiles}
+                  diagnostics={diagnostics}
+                  hasOriginalScreenshot={hasOriginalScreenshot}
+                  isDownloading={isDownloading}
+                  downloadComplete={downloadComplete}
+                  downloadError={downloadError}
+                  onDownload={() => void downloadZipByJobId(activeJobId, zipFilename)}
+                  onRecapture={() => void executeCapture(urlInput)}
+                  onWorkspaceUpdated={handleWorkspaceUpdated}
+                />
+              </>
             )}
 
             {/* Compact Recent Downloads Strip */}
@@ -588,16 +886,32 @@ export default function App() {
                           <span>{entry.stats.assetsCaptured} assets</span>
                           <span aria-hidden="true">·</span>
                           <span>{formatBytes(entry.stats.zipBytes ?? entry.stats.totalBytes)}</span>
+                          {entry.stats.durationMs > 0 && (
+                            <>
+                              <span aria-hidden="true">·</span>
+                              <span>{formatDurationMs(entry.stats.durationMs)}</span>
+                            </>
+                          )}
                         </div>
                       </div>
-                      <button
-                        type="button"
-                        onClick={() => handleLoadFromHistory(entry)}
-                        className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer whitespace-nowrap shrink-0"
-                      >
-                        <RotateCcw className="h-3 w-3" />
-                        <span>Reuse</span>
-                      </button>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => void handleDownloadFromHistory(entry)}
+                          className="inline-flex items-center gap-1 rounded-lg border border-slate-200 dark:border-slate-700 px-2.5 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                        >
+                          <Download className="h-3 w-3" />
+                          <span>ZIP</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleLoadFromHistory(entry, true)}
+                          className="inline-flex items-center gap-1 rounded-lg border border-slate-200 dark:border-slate-700 px-2.5 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                        >
+                          <RotateCcw className="h-3 w-3" />
+                          <span>Recapture</span>
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -610,7 +924,9 @@ export default function App() {
       {/* Clean Minimal Footer */}
       <footer className="border-t border-slate-200 dark:border-slate-800/80 px-4 sm:px-6 py-5">
         <div className="mx-auto flex max-w-6xl flex-col sm:flex-row items-center justify-between gap-3 text-xs text-slate-500 dark:text-slate-400">
-          <span>SiteGrab — Only use on websites you own or have permission to copy.</span>
+          <span>
+            SiteGrab — Only use on websites you own or have permission to copy.
+          </span>
           <div className="flex items-center gap-4">
             <button
               type="button"
@@ -624,7 +940,7 @@ export default function App() {
               onClick={() => setActiveView('history')}
               className="hover:text-slate-900 dark:hover:text-slate-200 transition-colors cursor-pointer"
             >
-              Download History
+              Project History
             </button>
           </div>
         </div>

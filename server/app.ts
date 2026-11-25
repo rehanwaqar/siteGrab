@@ -4,12 +4,28 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import express, { type Express, type Request, type Response } from 'express';
+import { chromium } from 'playwright';
+import {
+  AiServiceError,
+  isEditableTextFile,
+  resolveSafeSiteFile,
+  runAiCodeAssistant,
+  type AiFileEdit,
+} from './ai.ts';
 import { CaptureError, runCaptureJob } from './capture.ts';
+import { formatCapturedCode } from './formatter.ts';
 import { IpRateLimiter } from './rateLimit.ts';
 import { normalizeAndParseUrl, SsrfValidationError, validateExternalUrl } from './ssrf.ts';
-import type { CaptureJob, CaptureOptions, CaptureStage, CaptureStats, ProgressEvent } from './types.ts';
+import type {
+  CaptureJob,
+  CaptureOptions,
+  CaptureStage,
+  CaptureStats,
+  ProgressEvent,
+} from './types.ts';
+import { createZipArchive, listDirectoryFiles } from './zipper.ts';
 
-const JOB_TTL_MS = 15 * 60 * 1000; // 15 minutes max retention if not downloaded
+const JOB_TTL_MS = 15 * 60 * 1000; // 15 minutes retention for preview, AI editing, and ZIP download
 const CLEANUP_INTERVAL_MS = 60 * 1000;
 
 const MIME_MAP: Record<string, string> = {
@@ -41,7 +57,7 @@ const MIME_MAP: Record<string, string> = {
 export function createSiteGrabServer(): Express {
   const app = express();
   app.set('trust proxy', 1);
-  app.use(express.json({ limit: '64kb' }));
+  app.use(express.json({ limit: '512kb' }));
 
   const jobs = new Map<string, CaptureJob>();
   const rateLimiter = new IpRateLimiter(5, 10 * 60 * 1000);
@@ -70,7 +86,19 @@ export function createSiteGrabServer(): Express {
   sweepTimer.unref();
 
   app.get('/api/health', (_req: Request, res: Response) => {
-    res.json({ ok: true, service: 'sitegrab' });
+    let chromiumInstalled = false;
+    try {
+      const execPath = chromium.executablePath();
+      chromiumInstalled = Boolean(execPath && fs.existsSync(execPath));
+    } catch {
+      chromiumInstalled = false;
+    }
+    res.json({
+      ok: true,
+      service: 'sitegrab',
+      chromiumInstalled,
+      aiConfigured: Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY.trim()),
+    });
   });
 
   app.post('/api/capture', async (req: Request, res: Response) => {
@@ -108,6 +136,11 @@ export function createSiteGrabServer(): Express {
       formatCode: body?.formatCode !== false,
       recoverSourceMaps: body?.recoverSourceMaps !== false,
       respectRobots: true, // Always enforce robots.txt compliance
+      includeImages: body?.includeImages !== false,
+      includeFonts: body?.includeFonts !== false,
+      mobileViewport: body?.mobileViewport === true,
+      saveScreenshots: body?.saveScreenshots === true,
+      preserveInternalNav: body?.preserveInternalNav !== false,
     };
 
     const jobId = crypto.randomUUID();
@@ -116,13 +149,23 @@ export function createSiteGrabServer(): Express {
     const siteDir = path.join(tempRoot, 'site');
     const zipFilename = `sitegrab-${safeHost}.zip`;
     const zipPath = path.join(tempRoot, zipFilename);
+    const originalScreenshotPath = path.join(tempRoot, '_original-preview.png');
 
     const stats: CaptureStats = {
       pagesCaptured: 0,
       assetsCaptured: 0,
+      htmlCount: 0,
+      cssCount: 0,
+      jsCount: 0,
+      imagesCount: 0,
+      fontsCount: 0,
+      otherAssetsCount: 0,
       totalBytes: 0,
       sourceMapsRecovered: 0,
       skippedRobots: 0,
+      failedAssetsCount: 0,
+      screenshotsCount: 0,
+      durationMs: 0,
     };
 
     const initialEvent: ProgressEvent = {
@@ -145,6 +188,14 @@ export function createSiteGrabServer(): Express {
       siteDir,
       zipPath,
       zipFilename,
+      originalScreenshotPath,
+      hasOriginalScreenshot: false,
+      files: [],
+      diagnostics: {
+        brokenImages: [],
+        failedResources: [],
+        unresolvedLinks: [],
+      },
       createdAt: Date.now(),
       expiresAt: Date.now() + JOB_TTL_MS,
       cleaned: false,
@@ -168,6 +219,13 @@ export function createSiteGrabServer(): Express {
         percent,
         detail,
         stats: { ...stats },
+        ...(stage === 'ready'
+          ? {
+              files: job.files,
+              diagnostics: job.diagnostics,
+              hasOriginalScreenshot: job.hasOriginalScreenshot,
+            }
+          : {}),
         errorCode,
       };
       job.lastEvent = evt;
@@ -215,7 +273,6 @@ export function createSiteGrabServer(): Express {
       }
     };
 
-    // Replay latest state immediately
     sendEvent(job.lastEvent);
     if (job.status === 'ready' || job.status === 'error') {
       return;
@@ -238,15 +295,197 @@ export function createSiteGrabServer(): Express {
       siteTitle: job.siteTitle,
       hostname: job.hostname,
       zipFilename: job.zipFilename,
+      files: job.files,
+      diagnostics: job.diagnostics,
+      hasOriginalScreenshot: job.hasOriginalScreenshot,
       cleaned: job.cleaned,
     });
+  });
+
+  // Serve original rendered screenshot for Original vs. Captured comparison
+  app.get('/api/capture/:jobId/original-screenshot', async (req: Request, res: Response) => {
+    const job = jobs.get(String(req.params.jobId));
+    if (!job || job.cleaned || !job.hasOriginalScreenshot) {
+      res.status(404).send('Original screenshot unavailable.');
+      return;
+    }
+    try {
+      await fsp.access(job.originalScreenshotPath);
+      res.setHeader('Content-Type', 'image/png');
+      res.setHeader('Cache-Control', 'no-store');
+      fs.createReadStream(job.originalScreenshotPath).pipe(res);
+    } catch {
+      res.status(404).send('Original screenshot not found.');
+    }
+  });
+
+  // Read individual captured text file safely for inspection / AI context
+  app.get('/api/capture/:jobId/file', async (req: Request, res: Response) => {
+    const job = jobs.get(String(req.params.jobId));
+    if (!job || job.cleaned || job.status !== 'ready') {
+      res.status(404).json({ error: 'Workspace not found or expired.' });
+      return;
+    }
+    const relPath = typeof req.query.path === 'string' ? req.query.path : '';
+    if (!isEditableTextFile(relPath)) {
+      res.status(400).json({ error: 'Only text source files (HTML, CSS, JS, JSON, MD) can be inspected.' });
+      return;
+    }
+    try {
+      const resolved = resolveSafeSiteFile(job.siteDir, relPath);
+      const stat = await fsp.stat(resolved);
+      if (stat.size > 512 * 1024) {
+        res.status(413).json({ error: 'File is larger than 512 KB preview limit.' });
+        return;
+      }
+      const content = await fsp.readFile(resolved, 'utf8');
+      res.json({ path: relPath, size: stat.size, content });
+    } catch (err) {
+      if (err instanceof AiServiceError) {
+        res.status(err.statusCode).json({ error: err.message });
+        return;
+      }
+      res.status(404).json({ error: 'File not found in captured project.' });
+    }
+  });
+
+  // Optional Gemini AI Code Assistant operating on real captured files
+  app.post('/api/capture/:jobId/ai', async (req: Request, res: Response) => {
+    const job = jobs.get(String(req.params.jobId));
+    if (!job || job.cleaned || job.status !== 'ready') {
+      res.status(404).json({ error: 'Capture workspace expired or not ready. Please recapture the site.' });
+      return;
+    }
+
+    const body = req.body as {
+      prompt?: unknown;
+      mode?: unknown;
+      selectedFile?: unknown;
+      history?: unknown;
+    };
+
+    const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+    if (!prompt || prompt.length > 4000) {
+      res.status(400).json({ error: 'Please enter a prompt (up to 4,000 characters).' });
+      return;
+    }
+
+    const mode = body.mode === 'explain' ? 'explain' : 'modify';
+    const selectedFile =
+      typeof body.selectedFile === 'string' && body.selectedFile.trim()
+        ? body.selectedFile.trim()
+        : undefined;
+
+    const history = Array.isArray(body.history)
+      ? body.history
+          .filter(
+            (m): m is { role: 'user' | 'model'; text: string } =>
+              Boolean(m) &&
+              (m.role === 'user' || m.role === 'model') &&
+              typeof m.text === 'string',
+          )
+          .slice(-6)
+      : [];
+
+    try {
+      const result = await runAiCodeAssistant({
+        job,
+        prompt,
+        mode,
+        selectedFile,
+        history,
+      });
+      res.json(result);
+    } catch (err) {
+      if (err instanceof AiServiceError) {
+        res.status(err.statusCode).json({ error: err.message });
+        return;
+      }
+      res.status(500).json({ error: 'AI assistant request failed.' });
+    }
+  });
+
+  // Apply AI-suggested file modifications to the captured project and rebuild ZIP
+  app.post('/api/capture/:jobId/apply-edits', async (req: Request, res: Response) => {
+    const job = jobs.get(String(req.params.jobId));
+    if (!job || job.cleaned || job.status !== 'ready') {
+      res.status(404).json({ error: 'Capture workspace expired or not ready.' });
+      return;
+    }
+
+    const body = req.body as { edits?: unknown };
+    if (!Array.isArray(body.edits) || body.edits.length === 0) {
+      res.status(400).json({ error: 'No edits provided.' });
+      return;
+    }
+
+    const appliedFiles: string[] = [];
+    try {
+      for (const rawEdit of body.edits as Partial<AiFileEdit>[]) {
+        if (
+          !rawEdit ||
+          typeof rawEdit.filePath !== 'string' ||
+          typeof rawEdit.updatedContent !== 'string'
+        ) {
+          continue;
+        }
+        const cleanRel = rawEdit.filePath.replace(/\\/g, '/').replace(/^\/+/, '');
+        if (!isEditableTextFile(cleanRel)) continue;
+
+        const dest = resolveSafeSiteFile(job.siteDir, cleanRel);
+        let contentToWrite = rawEdit.updatedContent;
+
+        if (job.options.formatCode) {
+          const ext = path.posix.extname(cleanRel).toLowerCase();
+          if (ext === '.html' || ext === '.htm') {
+            contentToWrite = await formatCapturedCode(contentToWrite, 'html');
+          } else if (ext === '.css') {
+            contentToWrite = await formatCapturedCode(contentToWrite, 'css');
+          } else if (ext === '.js' || ext === '.mjs') {
+            contentToWrite = await formatCapturedCode(contentToWrite, 'js');
+          }
+        }
+
+        await fsp.mkdir(path.dirname(dest), { recursive: true });
+        await fsp.writeFile(dest, contentToWrite, 'utf8');
+        appliedFiles.push(cleanRel);
+      }
+
+      if (appliedFiles.length === 0) {
+        res.status(400).json({ error: 'No valid editable files in edit list.' });
+        return;
+      }
+
+      // Refresh file list & repack ZIP archive with AI changes
+      job.files = await listDirectoryFiles(job.siteDir);
+      const totalBytes = job.files.reduce((sum, f) => sum + f.size, 0);
+      job.lastEvent.stats.totalBytes = totalBytes;
+
+      const rootFolderName = path.basename(job.zipFilename, '.zip') || `sitegrab-${job.hostname}`;
+      const zipBytes = await createZipArchive(job.siteDir, job.zipPath, rootFolderName);
+      job.lastEvent.stats.zipBytes = zipBytes;
+      job.lastEvent.files = job.files;
+      job.expiresAt = Date.now() + JOB_TTL_MS;
+
+      res.json({
+        appliedFiles,
+        files: job.files,
+        stats: job.lastEvent.stats,
+      });
+    } catch (err) {
+      if (err instanceof AiServiceError) {
+        res.status(err.statusCode).json({ error: err.message });
+        return;
+      }
+      res.status(500).json({ error: 'Failed to apply edits and rebuild ZIP.' });
+    }
   });
 
   // Sandboxed live preview of the captured site
   app.get('/api/capture/:jobId/preview/*', async (req: Request, res: Response) => {
     const job = jobs.get(String(req.params.jobId));
     if (!job || job.cleaned || job.status !== 'ready') {
-      res.status(404).send('Preview unavailable or archive already cleaned up.');
+      res.status(404).send('Preview unavailable or archive expired.');
       return;
     }
 
@@ -274,10 +513,12 @@ export function createSiteGrabServer(): Express {
       const ext = path.extname(targetPath).toLowerCase();
       res.setHeader('Content-Type', MIME_MAP[ext] || 'application/octet-stream');
       res.setHeader('Cache-Control', 'no-store');
-      // Prevent framed preview from executing arbitrary external network fetches
+      const hostHeader = req.get('x-forwarded-host') || req.get('host');
+      const protoHeader = (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
+      const originSource = hostHeader ? `${protoHeader}://${hostHeader} http://${hostHeader}` : '';
       res.setHeader(
         'Content-Security-Policy',
-        "default-src 'self' data: blob: 'unsafe-inline' 'unsafe-eval'; frame-ancestors 'self';",
+        `default-src 'self' ${originSource} data: blob: 'unsafe-inline' 'unsafe-eval'; connect-src 'none';`,
       );
       fs.createReadStream(targetPath).pipe(res);
     } catch {
@@ -285,20 +526,36 @@ export function createSiteGrabServer(): Express {
     }
   });
 
-  // Redirect bare /preview/:jobId to /preview/:jobId/ so relative URLs resolve properly
   app.get('/api/capture/:jobId/preview', (req: Request, res: Response) => {
     res.redirect(302, `/api/capture/${encodeURIComponent(String(req.params.jobId))}/preview/index.html`);
   });
 
-  // Stream ZIP archive and delete temp files afterward
+  app.head('/api/capture/:jobId/download', async (req: Request, res: Response) => {
+    const job = jobs.get(String(req.params.jobId));
+    if (!job || job.cleaned || job.status !== 'ready') {
+      res.status(404).end();
+      return;
+    }
+    try {
+      const stat = await fsp.stat(job.zipPath);
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Length', String(stat.size));
+      res.setHeader('Content-Disposition', `attachment; filename="${job.zipFilename}"`);
+      res.status(200).end();
+    } catch {
+      res.status(404).end();
+    }
+  });
+
+  // Stream ZIP archive cleanly while preserving workspace for preview & AI edits during TTL
   app.get('/api/capture/:jobId/download', async (req: Request, res: Response) => {
     const job = jobs.get(String(req.params.jobId));
     if (!job) {
-      res.status(404).json({ error: 'Archive not found or expired.' });
+      res.status(404).json({ error: 'Archive not found or expired. Click Recapture to regenerate it.' });
       return;
     }
     if (job.cleaned) {
-      res.status(410).json({ error: 'Archive was already downloaded and temporary files were removed.' });
+      res.status(410).json({ error: 'Workspace was closed and temporary files were removed.' });
       return;
     }
     if (job.status !== 'ready') {
@@ -308,22 +565,18 @@ export function createSiteGrabServer(): Express {
 
     try {
       const stat = await fsp.stat(job.zipPath);
+      if (stat.size <= 0) {
+        res.status(500).json({ error: 'Generated ZIP archive is empty.' });
+        return;
+      }
+
       res.setHeader('Content-Type', 'application/zip');
       res.setHeader('Content-Length', String(stat.size));
       res.setHeader('Content-Disposition', `attachment; filename="${job.zipFilename}"`);
+      res.setHeader('Cache-Control', 'no-store');
 
       const stream = fs.createReadStream(job.zipPath);
-      let cleanedUp = false;
-      const cleanAfterStream = () => {
-        if (cleanedUp) return;
-        cleanedUp = true;
-        void cleanupJobFiles(job);
-      };
-
-      res.on('finish', cleanAfterStream);
-      res.on('close', cleanAfterStream);
       stream.on('error', () => {
-        cleanAfterStream();
         if (!res.headersSent) {
           res.status(500).json({ error: 'Failed to stream ZIP archive.' });
         }
@@ -333,6 +586,19 @@ export function createSiteGrabServer(): Express {
     } catch {
       res.status(404).json({ error: 'ZIP file no longer available.' });
     }
+  });
+
+  // Explicit workspace cleanup endpoint
+  app.delete('/api/capture/:jobId', async (req: Request, res: Response) => {
+    const jobId = String(req.params.jobId);
+    const job = jobs.get(jobId);
+    if (!job) {
+      res.json({ ok: true });
+      return;
+    }
+    await cleanupJobFiles(job);
+    jobs.delete(jobId);
+    res.json({ ok: true });
   });
 
   return app;

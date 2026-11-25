@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import type { Writable } from 'node:stream';
-import type { CaptureStats } from './types.ts';
+import type { CapturedFileEntry, CaptureStats } from './types.ts';
 
 interface ArchiverV8Instance {
   on(event: string, listener: (err: Error) => void): this;
@@ -16,6 +16,55 @@ interface ArchiverV8Module {
   ZipArchive: new (options?: { zlib?: { level?: number } }) => ArchiverV8Instance;
 }
 
+export async function listDirectoryFiles(rootDir: string): Promise<CapturedFileEntry[]> {
+  const results: CapturedFileEntry[] = [];
+
+  async function walk(currentDir: string) {
+    const entries = await fsp.readdir(currentDir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(currentDir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(fullPath);
+      } else if (entry.isFile()) {
+        const stat = await fsp.stat(fullPath);
+        const rel = path.relative(rootDir, fullPath).split(path.sep).join('/');
+        results.push({ path: rel, size: stat.size });
+      }
+    }
+  }
+
+  await walk(rootDir);
+  results.sort((a, b) => a.path.localeCompare(b.path));
+  return results;
+}
+
+export async function writeArchivePackageJson(options: {
+  siteDir: string;
+  hostname: string;
+  siteTitle: string;
+}): Promise<boolean> {
+  const { siteDir, hostname, siteTitle } = options;
+  const safeName = `sitegrab-${hostname.toLowerCase().replace(/[^a-z0-9.-]/g, '-')}`;
+
+  const pkg = {
+    name: safeName,
+    version: '1.0.0',
+    private: true,
+    description: `Offline static snapshot of ${siteTitle || hostname} captured with SiteGrab.`,
+    scripts: {
+      dev: 'npx serve .',
+      start: 'npx serve .',
+    },
+  };
+
+  await fsp.writeFile(
+    path.join(siteDir, 'package.json'),
+    JSON.stringify(pkg, null, 2) + '\n',
+    'utf8',
+  );
+  return true;
+}
+
 export async function writeArchiveReadme(options: {
   siteDir: string;
   targetUrl: string;
@@ -23,22 +72,31 @@ export async function writeArchiveReadme(options: {
   stats: CaptureStats;
   formatted: boolean;
   recoveredSourceMaps: boolean;
+  hasPackageJson: boolean;
 }): Promise<void> {
-  const { siteDir, targetUrl, siteTitle, stats, formatted, recoveredSourceMaps } = options;
+  const {
+    siteDir,
+    targetUrl,
+    siteTitle,
+    stats,
+    formatted,
+    recoveredSourceMaps,
+    hasPackageJson,
+  } = options;
 
   const readme = `# ${siteTitle || 'Captured Website'}
 
 Captured with **SiteGrab** from \`${targetUrl}\`.
 
-> **Ownership Notice:** Ensure you own or have explicit permission to store, modify, or redistribute the contents of this archive.
+> **Ownership & Scope Notice:** Ensure you own or have explicit permission to store, modify, or redistribute the contents of this archive. Static capture reproduces client-side HTML, CSS, JavaScript, and public assets only; server-side APIs, authentication, and databases cannot be reproduced automatically.
 
-## Quick Start (Run Locally)
+## Quick Start (Run Locally in VS Code)
 
 Open this folder in **VS Code** and launch a local static server using any of the options below:
 
 ### Option 1: Node.js (\`serve\`)
 \`\`\`bash
-npx serve .
+${hasPackageJson ? 'npm run dev' : 'npx serve .'}
 \`\`\`
 Then open \`http://localhost:3000\` in your browser.
 
@@ -56,32 +114,41 @@ Then open \`http://localhost:8080\`.
 
 - \`index.html\` — Entry page (rendered DOM with relative local paths)
 - \`assets/css/\` — Stylesheets with rewritten local \`url(...)\` references
-- \`assets/js/\` — Captured scripts
-- \`assets/images/\` — Images, icons, and vector graphics
-- \`assets/fonts/\` — Web fonts (\`.woff2\`, \`.woff\`, \`.ttf\`, etc.)
-${recoveredSourceMaps && stats.sourceMapsRecovered > 0 ? '- `recovered-src/` — Original source files reconstructed from published `.map` source maps\n' : ''}
+- \`assets/js/\` — Captured client-side scripts
+- \`assets/images/\` — Downloaded images, icons, and SVGs
+- \`assets/fonts/\` — Downloaded web fonts (\`.woff2\`, \`.woff\`, \`.ttf\`, etc.)
+${stats.screenshotsCount > 0 ? '- `screenshots/` — Rendered page screenshots captured during snapshot\n' : ''}${recoveredSourceMaps && stats.sourceMapsRecovered > 0 ? '- `recovered-src/` — Original source files reconstructed from published `.map` source maps\n' : ''}${hasPackageJson ? '- `package.json` — Local development script manifest (`npm run dev`)\n' : ''}
 ## Snapshot Summary
 
 - **Pages captured:** ${stats.pagesCaptured}
-- **Assets saved:** ${stats.assetsCaptured}
+- **HTML / CSS / JS files:** ${stats.htmlCount} / ${stats.cssCount} / ${stats.jsCount}
+- **Images / Fonts downloaded:** ${stats.imagesCount} / ${stats.fontsCount}
+- **Failed resources:** ${stats.failedAssetsCount}
 - **Source map files recovered:** ${stats.sourceMapsRecovered}
 - **Prettier formatted:** ${formatted ? 'Yes (HTML, CSS, JS)' : 'No'}
+- **Capture duration:** ${(stats.durationMs / 1000).toFixed(2)}s
 - **Total captured size:** ${(stats.totalBytes / (1024 * 1024)).toFixed(2)} MB
 `;
 
   await fsp.writeFile(path.join(siteDir, 'README.md'), readme, 'utf8');
 }
 
-export async function createZipArchive(sourceDir: string, zipPath: string): Promise<number> {
+export async function createZipArchive(
+  sourceDir: string,
+  zipPath: string,
+  rootFolderName?: string,
+): Promise<number> {
   await fsp.mkdir(path.dirname(zipPath), { recursive: true });
   const { ZipArchive } = (await import('archiver')) as unknown as ArchiverV8Module;
 
-  return new Promise((resolve, reject) => {
+  const destInZip = rootFolderName && rootFolderName.trim() ? rootFolderName.trim() : false;
+
+  await new Promise<void>((resolve, reject) => {
     const output = fs.createWriteStream(zipPath);
     const archive = new ZipArchive({ zlib: { level: 6 } });
 
     output.on('close', () => {
-      resolve(archive.pointer());
+      resolve();
     });
 
     output.on('error', (err) => {
@@ -93,7 +160,10 @@ export async function createZipArchive(sourceDir: string, zipPath: string): Prom
     });
 
     archive.pipe(output);
-    archive.directory(sourceDir, false);
+    archive.directory(sourceDir, destInZip);
     void archive.finalize();
   });
+
+  const stat = await fsp.stat(zipPath);
+  return stat.size;
 }
