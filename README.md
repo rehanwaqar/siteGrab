@@ -74,9 +74,8 @@ fly deploy
 ```
 Ensure your `fly.toml` internal port matches `3000`.
 
-## Author
+## Links
 
-**Mohammed Waqar Ahmed**
-- GitHub: [github.com/rehanwaqar](https://github.com/rehanwaqar)
+- GitHub: [github.com/rehanwaqar/siteGrab](https://github.com/rehanwaqar/siteGrab)
 - LinkedIn: [linkedin.com/in/mohammed-waqar-ahmed-38a856322](https://www.linkedin.com/in/mohammed-waqar-ahmed-38a856322/)
 

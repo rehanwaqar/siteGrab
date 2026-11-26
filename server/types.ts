@@ -10,6 +10,8 @@ export type CaptureStage =
   | 'ready'
   | 'error';
 
+export type WaitStrategy = 'networkidle' | 'load' | 'domcontentloaded';
+
 export interface CaptureOptions {
   url: string;
   crawlDepth: number; // 0 = single page, 1..3 = follow internal links
@@ -22,6 +24,8 @@ export interface CaptureOptions {
   mobileViewport: boolean;
   saveScreenshots: boolean;
   preserveInternalNav: boolean;
+  timeoutMs?: number; // 15000..120000, default 60000
+  waitStrategy?: WaitStrategy;
 }
 
 export interface CapturedFileEntry {

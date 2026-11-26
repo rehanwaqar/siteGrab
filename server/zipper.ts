@@ -145,7 +145,7 @@ export async function createZipArchive(
 
   await new Promise<void>((resolve, reject) => {
     const output = fs.createWriteStream(zipPath);
-    const archive = new ZipArchive({ zlib: { level: 6 } });
+    const archive = new ZipArchive({ zlib: { level: 3 } });
 
     output.on('close', () => {
       resolve();

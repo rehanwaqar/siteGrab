@@ -48,7 +48,7 @@ const QUICK_PROMPTS: Array<{ label: string; mode: 'explain' | 'modify'; prompt: 
   },
 ];
 
-const TEXT_EXTS = ['.html', '.htm', '.css', '.js', '.mjs', '.json', '.md'];
+const TEXT_EXTS = ['.html', '.htm', '.css', '.js', '.mjs', '.ts', '.tsx', '.jsx', '.json', '.md', '.txt', '.svg'];
 
 export function AiAssistantPanel({ jobId, files, onEditsApplied }: AiAssistantPanelProps) {
   const editableFiles = files.filter((f) =>

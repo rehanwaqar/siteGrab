@@ -4,8 +4,9 @@ export async function formatCapturedCode(
   content: string,
   ext: 'html' | 'css' | 'js',
 ): Promise<string> {
-  // Skip massive bundled JS files > 1.5 MB to stay well inside the 60s job budget
-  if (content.length > 1.5 * 1024 * 1024) {
+  // Skip large minified bundles so formatting stays fast inside the job budget
+  const limit = ext === 'html' ? 350 * 1024 : 180 * 1024;
+  if (content.length > limit) {
     return content;
   }
 

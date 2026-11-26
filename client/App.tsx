@@ -1,18 +1,22 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
 import {
   AlertTriangle,
   Download,
   ExternalLink,
+  FileArchive,
   Github,
   Globe,
+  Image as ImageIcon,
   Linkedin,
+  Loader2,
   MessageSquarePlus,
   Moon,
   RotateCcw,
-  ShieldAlert,
   SlidersHorizontal,
   Sun,
+  Upload,
 } from 'lucide-react';
+import { FailureRecoveryPanel, type RecoveryRetrySettings } from './components/FailureRecoveryPanel';
 import { FeedbackView } from './components/FeedbackView';
 import { HistoryView } from './components/HistoryView';
 import { PreviewPanel } from './components/PreviewPanel';
@@ -32,7 +36,6 @@ import {
   formatBytes,
   formatDurationMs,
   formatRelativeTime,
-  getFriendlyErrorTitle,
 } from './utils/format';
 
 const HISTORY_STORAGE_KEY = 'sitegrab_history_v1';
@@ -91,12 +94,20 @@ export default function App() {
   const [progressEvent, setProgressEvent] = useState<ProgressEvent | null>(null);
   const [errorState, setErrorState] = useState<{ code?: string; message: string } | null>(null);
   const [isDownloading, setIsDownloading] = useState<boolean>(false);
+  const [downloadPercent, setDownloadPercent] = useState<number | null>(null);
   const [downloadComplete, setDownloadComplete] = useState<boolean>(false);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [quickMode, setQuickMode] = useState<'none' | 'screenshot' | 'zip'>('none');
+  const [quickShotNotes, setQuickShotNotes] = useState<string>('');
+  const [quickUploadError, setQuickUploadError] = useState<string | null>(null);
+  const [isProcessingUpload, setIsProcessingUpload] = useState<boolean>(false);
 
   const [history, setHistory] = useState<HistoryEntry[]>(loadHistory);
 
   const eventSourceRef = useRef<EventSource | null>(null);
+  const urlInputRef = useRef<HTMLInputElement | null>(null);
+  const quickShotInputRef = useRef<HTMLInputElement | null>(null);
+  const quickZipInputRef = useRef<HTMLInputElement | null>(null);
   const autoDownloadRef = useRef<boolean>(autoDownload);
   autoDownloadRef.current = autoDownload;
 
@@ -146,6 +157,7 @@ export default function App() {
 
   const downloadZipByJobId = useCallback(async (jobId: string, filename: string): Promise<boolean> => {
     setIsDownloading(true);
+    setDownloadPercent(0);
     setDownloadError(null);
     try {
       const res = await fetch(`/api/capture/${encodeURIComponent(jobId)}/download`, {
@@ -163,7 +175,32 @@ export default function App() {
         return false;
       }
 
-      const blob = await res.blob();
+      const contentLengthHeader = res.headers.get('content-length');
+      const totalBytes = contentLengthHeader ? Number(contentLengthHeader) : 0;
+
+      let blob: Blob;
+      if (res.body) {
+        const reader = res.body.getReader();
+        const chunks: Uint8Array[] = [];
+        let received = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) {
+            chunks.push(value);
+            received += value.length;
+            if (totalBytes > 0) {
+              setDownloadPercent(Math.min(99, Math.round((received / totalBytes) * 100)));
+            }
+          }
+        }
+        setDownloadPercent(100);
+        blob = new Blob(chunks as BlobPart[], { type: 'application/zip' });
+      } else {
+        blob = await res.blob();
+        setDownloadPercent(100);
+      }
+
       if (!blob || blob.size === 0) {
         setDownloadError('Received an empty ZIP archive from the server. Please recapture the site.');
         return false;
@@ -184,6 +221,7 @@ export default function App() {
       return false;
     } finally {
       setIsDownloading(false);
+      setDownloadPercent(null);
     }
   }, []);
 
@@ -385,6 +423,247 @@ export default function App() {
     void executeCapture(urlInput);
   };
 
+  const handleRecoveryRetry = (recovery: RecoveryRetrySettings) => {
+    void executeCapture(urlInput, {
+      crawlDepth,
+      maxPages: crawlDepth > 0 ? maxPages : 1,
+      formatCode,
+      recoverSourceMaps,
+      includeImages,
+      includeFonts,
+      mobileViewport,
+      saveScreenshots,
+      preserveInternalNav,
+      timeoutMs: recovery.timeoutMs,
+      waitStrategy: recovery.waitStrategy,
+    });
+  };
+
+  const handleUploadZip = async (file: File) => {
+    closeActiveStream();
+    setDownloadComplete(false);
+    setDownloadError(null);
+
+    const res = await fetch('/api/capture/import-zip', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/zip',
+        'X-Zip-Filename': file.name,
+        'X-Format-Code': String(formatCode),
+        'X-Include-Images': String(includeImages),
+        'X-Include-Fonts': String(includeFonts),
+        'X-Preserve-Nav': String(preserveInternalNav),
+      },
+      body: file,
+    });
+
+    const data = (await res.json()) as {
+      jobId?: string;
+      url?: string;
+      hostname?: string;
+      siteTitle?: string;
+      zipFilename?: string;
+      event?: ProgressEvent;
+      error?: string;
+    };
+
+    if (!res.ok || !data.jobId || !data.event) {
+      throw new Error(data.error || 'Could not extract the uploaded ZIP archive.');
+    }
+
+    const host = data.hostname || 'imported-site';
+    const resolvedZip = data.zipFilename || `sitegrab-${host}.zip`;
+    const resolvedTitle = data.siteTitle || host;
+    const evt = data.event;
+
+    setErrorState(null);
+    setActiveJobId(data.jobId);
+    setActiveHostname(host);
+    setSiteTitle(resolvedTitle);
+    setZipFilename(resolvedZip);
+    setCapturedFiles(evt.files ?? []);
+    setDiagnostics(evt.diagnostics ?? EMPTY_DIAGNOSTICS);
+    setHasOriginalScreenshot(false);
+    setProgressEvent(evt);
+
+    const importedEntry: HistoryEntry = {
+      id: data.jobId,
+      url: data.url || `zip://${file.name}`,
+      hostname: host,
+      siteTitle: resolvedTitle,
+      zipFilename: resolvedZip,
+      capturedAt: Date.now(),
+      stats: evt.stats,
+      options: {
+        crawlDepth: 0,
+        maxPages: 1,
+        formatCode,
+        recoverSourceMaps: false,
+        includeImages,
+        includeFonts,
+        mobileViewport: false,
+        saveScreenshots: false,
+        preserveInternalNav,
+      },
+    };
+    setHistory((prev) => [importedEntry, ...prev.filter((item) => item.id !== data.jobId)].slice(0, 15));
+
+    if (autoDownloadRef.current) {
+      await downloadZipByJobId(data.jobId, resolvedZip);
+    }
+  };
+
+  const handleUploadScreenshot = async (file: File, notes?: string) => {
+    closeActiveStream();
+    setErrorState(null);
+    setDownloadComplete(false);
+    setDownloadError(null);
+    setCapturedFiles([]);
+    setDiagnostics(EMPTY_DIAGNOSTICS);
+    setActiveJobId(null);
+    setActiveHostname(file.name);
+    setProgressEvent({
+      jobId: 'screenshot-pending',
+      stage: 'capturing',
+      message: `Analyzing ${file.name} and generating responsive HTML, CSS & JS...`,
+      percent: 42,
+      detail: 'Converting screenshot layout into clean VS Code-ready files',
+      stats: {
+        pagesCaptured: 0,
+        assetsCaptured: 0,
+        htmlCount: 0,
+        cssCount: 0,
+        jsCount: 0,
+        imagesCount: 0,
+        fontsCount: 0,
+        otherAssetsCount: 0,
+        totalBytes: 0,
+        sourceMapsRecovered: 0,
+        skippedRobots: 0,
+        failedAssetsCount: 0,
+        screenshotsCount: 0,
+        durationMs: 0,
+      },
+    });
+
+    const headers: Record<string, string> = {
+      'Content-Type': file.type || 'image/png',
+      'X-Screenshot-Filename': file.name,
+      'X-Format-Code': String(formatCode),
+    };
+    if (notes && notes.trim()) {
+      headers['X-Screenshot-Notes'] = notes.trim().slice(0, 1200);
+    }
+
+    const res = await fetch('/api/capture/from-screenshot', {
+      method: 'POST',
+      headers,
+      body: file,
+    });
+
+    const data = (await res.json()) as {
+      jobId?: string;
+      url?: string;
+      hostname?: string;
+      siteTitle?: string;
+      zipFilename?: string;
+      event?: ProgressEvent;
+      error?: string;
+    };
+
+    if (!res.ok || !data.jobId || !data.event) {
+      setProgressEvent(null);
+      throw new Error(data.error || 'Could not generate website from the uploaded screenshot.');
+    }
+
+    const host = data.hostname || 'screenshot-site';
+    const resolvedZip = data.zipFilename || `sitegrab-${host}.zip`;
+    const resolvedTitle = data.siteTitle || host;
+    const evt = data.event;
+
+    setErrorState(null);
+    setActiveJobId(data.jobId);
+    setActiveHostname(host);
+    setSiteTitle(resolvedTitle);
+    setZipFilename(resolvedZip);
+    setCapturedFiles(evt.files ?? []);
+    setDiagnostics(evt.diagnostics ?? EMPTY_DIAGNOSTICS);
+    setHasOriginalScreenshot(Boolean(evt.hasOriginalScreenshot ?? true));
+    setProgressEvent(evt);
+    setQuickMode('none');
+
+    const generatedEntry: HistoryEntry = {
+      id: data.jobId,
+      url: data.url || `screenshot://${file.name}`,
+      hostname: host,
+      siteTitle: resolvedTitle,
+      zipFilename: resolvedZip,
+      capturedAt: Date.now(),
+      stats: evt.stats,
+      options: {
+        crawlDepth: 0,
+        maxPages: 1,
+        formatCode,
+        recoverSourceMaps: false,
+        includeImages: true,
+        includeFonts: true,
+        mobileViewport: false,
+        saveScreenshots: false,
+        preserveInternalNav: true,
+      },
+    };
+    setHistory((prev) =>
+      [generatedEntry, ...prev.filter((item) => item.id !== data.jobId)].slice(0, 15),
+    );
+
+    if (autoDownloadRef.current) {
+      await downloadZipByJobId(data.jobId, resolvedZip);
+    }
+  };
+
+  const handleQuickShotChange = async (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    if (!/\.(png|jpe?g|webp|gif)$/i.test(file.name) && !file.type.startsWith('image/')) {
+      setQuickUploadError('Please select a PNG, JPEG, WebP, or GIF image.');
+      return;
+    }
+    setQuickUploadError(null);
+    setIsProcessingUpload(true);
+    try {
+      await handleUploadScreenshot(file, quickShotNotes);
+    } catch (err) {
+      setQuickUploadError(
+        err instanceof Error ? err.message : 'Could not generate website from screenshot.',
+      );
+    } finally {
+      setIsProcessingUpload(false);
+    }
+  };
+
+  const handleQuickZipChange = async (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith('.zip')) {
+      setQuickUploadError('Please select a valid .zip archive.');
+      return;
+    }
+    setQuickUploadError(null);
+    setIsProcessingUpload(true);
+    try {
+      await handleUploadZip(file);
+      setQuickMode('none');
+    } catch (err) {
+      setQuickUploadError(
+        err instanceof Error ? err.message : 'Could not process the uploaded ZIP.',
+      );
+    } finally {
+      setIsProcessingUpload(false);
+    }
+  };
+
   const handleLoadFromHistory = (entry: HistoryEntry, autoRun = false) => {
     const restoredOpts: Omit<CaptureOptions, 'url'> = {
       crawlDepth: entry.options.crawlDepth ?? 0,
@@ -574,6 +853,7 @@ export default function App() {
                   <div className="relative flex-1">
                     <Globe className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
                     <input
+                      ref={urlInputRef}
                       type="text"
                       inputMode="url"
                       aria-label="Website URL"
@@ -608,8 +888,201 @@ export default function App() {
                     </button>
                   </span>
                 </p>
+
+                {/* Direct Screenshot-to-Site & ZIP Import Triggers */}
+                <div className="mt-4 flex flex-wrap items-center justify-center gap-2 text-xs">
+                  <span className="text-slate-500 dark:text-slate-400">
+                    No link or ZIP?
+                  </span>
+                  <button
+                    type="button"
+                    disabled={isCapturing || isProcessingUpload}
+                    onClick={() => {
+                      setQuickUploadError(null);
+                      setQuickMode((prev) => (prev === 'screenshot' ? 'none' : 'screenshot'));
+                    }}
+                    className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 font-medium transition-colors cursor-pointer ${
+                      quickMode === 'screenshot'
+                        ? 'border-sky-500 bg-sky-600 text-white'
+                        : 'border-slate-300 dark:border-slate-700 bg-white dark:bg-[#111827] text-slate-700 dark:text-slate-200 hover:border-sky-500/60'
+                    }`}
+                  >
+                    <ImageIcon className="h-3.5 w-3.5" />
+                    <span>Generate from Screenshot</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isCapturing || isProcessingUpload}
+                    onClick={() => {
+                      setQuickUploadError(null);
+                      setQuickMode((prev) => (prev === 'zip' ? 'none' : 'zip'));
+                    }}
+                    className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 font-medium transition-colors cursor-pointer ${
+                      quickMode === 'zip'
+                        ? 'border-sky-500 bg-sky-600 text-white'
+                        : 'border-slate-300 dark:border-slate-700 bg-white dark:bg-[#111827] text-slate-700 dark:text-slate-200 hover:border-sky-500/60'
+                    }`}
+                  >
+                    <FileArchive className="h-3.5 w-3.5" />
+                    <span>Upload Project ZIP</span>
+                  </button>
+                </div>
+
+                {quickMode === 'screenshot' && (
+                  <div className="mx-auto mt-4 max-w-2xl rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-4 text-left space-y-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+                        Screenshot to Website Generator
+                      </span>
+                      <span className="text-[11px] font-mono text-slate-500 dark:text-slate-400">
+                        PNG · JPEG · WebP · GIF (max 10 MB)
+                      </span>
+                    </div>
+                    <input
+                      type="text"
+                      value={quickShotNotes}
+                      onChange={(e) => setQuickShotNotes(e.target.value)}
+                      disabled={isProcessingUpload}
+                      placeholder="Optional style or feature notes (e.g., Match dark header, interactive tabs)"
+                      className="h-9 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-[#0B0F17] px-3 text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:border-sky-500 focus:outline-none"
+                    />
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <input
+                        ref={quickShotInputRef}
+                        type="file"
+                        accept="image/png,image/jpeg,image/webp,image/gif"
+                        onChange={(e) => void handleQuickShotChange(e)}
+                        className="hidden"
+                        aria-label="Upload website screenshot"
+                      />
+                      <button
+                        type="button"
+                        disabled={isProcessingUpload}
+                        onClick={() => quickShotInputRef.current?.click()}
+                        className="inline-flex items-center gap-2 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:opacity-60 px-4 py-2 text-xs font-semibold text-white transition-colors cursor-pointer"
+                      >
+                        {isProcessingUpload ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Upload className="h-3.5 w-3.5" />
+                        )}
+                        <span>
+                          {isProcessingUpload ? 'Generating Website...' : 'Choose Screenshot & Generate'}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setQuickMode('none')}
+                        className="text-xs text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 cursor-pointer"
+                      >
+                        Close
+                      </button>
+                    </div>
+                    {quickUploadError && (
+                      <div className="rounded-lg border border-red-200 dark:border-red-900/60 bg-red-50 dark:bg-red-950/30 px-3 py-2 text-xs text-red-700 dark:text-red-300">
+                        {quickUploadError}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {quickMode === 'zip' && (
+                  <div className="mx-auto mt-4 max-w-2xl rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-4 text-left space-y-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+                        Import Website Builder ZIP (Bolt, Lovable, GitHub)
+                      </span>
+                      <span className="text-[11px] font-mono text-slate-500 dark:text-slate-400">
+                        .zip archive (max 50 MB)
+                      </span>
+                    </div>
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <input
+                        ref={quickZipInputRef}
+                        type="file"
+                        accept=".zip,application/zip,application/x-zip-compressed"
+                        onChange={(e) => void handleQuickZipChange(e)}
+                        className="hidden"
+                        aria-label="Upload project ZIP"
+                      />
+                      <button
+                        type="button"
+                        disabled={isProcessingUpload}
+                        onClick={() => quickZipInputRef.current?.click()}
+                        className="inline-flex items-center gap-2 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:opacity-60 px-4 py-2 text-xs font-semibold text-white transition-colors cursor-pointer"
+                      >
+                        {isProcessingUpload ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Upload className="h-3.5 w-3.5" />
+                        )}
+                        <span>
+                          {isProcessingUpload ? 'Extracting ZIP...' : 'Choose .zip Archive'}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setQuickMode('none')}
+                        className="text-xs text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 cursor-pointer"
+                      >
+                        Close
+                      </button>
+                    </div>
+                    {quickUploadError && (
+                      <div className="rounded-lg border border-red-200 dark:border-red-900/60 bg-red-50 dark:bg-red-950/30 px-3 py-2 text-xs text-red-700 dark:text-red-300">
+                        {quickUploadError}
+                      </div>
+                    )}
+                  </div>
+                )}
               </form>
             </section>
+
+            {/* Live SSE Progress Bar (directly under URL form so no scrolling needed) */}
+            {progressEvent && progressEvent.stage !== 'error' && (
+              <ProgressPanel event={progressEvent} targetHostname={activeHostname} />
+            )}
+
+            {/* Smart Capture Failure Recovery (shown immediately below URL form when capture fails) */}
+            {errorState && !isCapturing && (
+              <FailureRecoveryPanel
+                errorCode={errorState.code}
+                errorMessage={errorState.message}
+                targetUrl={urlInput}
+                onRetryCapture={handleRecoveryRetry}
+                onUploadZip={handleUploadZip}
+                onUploadScreenshot={handleUploadScreenshot}
+                onFocusUrlInput={() => {
+                  urlInputRef.current?.focus();
+                  urlInputRef.current?.select();
+                }}
+                onDismiss={() => setErrorState(null)}
+              />
+            )}
+
+            {/* Capture Results Dashboard + Preview / Files / Diagnostics / AI Workspace */}
+            {progressEvent?.stage === 'ready' && activeJobId && (
+              <>
+                <ResultsDashboard stats={progressEvent.stats} hostname={activeHostname} />
+                <PreviewPanel
+                  jobId={activeJobId}
+                  siteTitle={siteTitle}
+                  hostname={activeHostname}
+                  zipFilename={zipFilename}
+                  event={progressEvent}
+                  files={capturedFiles}
+                  diagnostics={diagnostics}
+                  hasOriginalScreenshot={hasOriginalScreenshot}
+                  isDownloading={isDownloading}
+                  downloadPercent={downloadPercent}
+                  downloadComplete={downloadComplete}
+                  downloadError={downloadError}
+                  onDownload={() => void downloadZipByJobId(activeJobId, zipFilename)}
+                  onRecapture={() => void executeCapture(urlInput)}
+                  onWorkspaceUpdated={handleWorkspaceUpdated}
+                />
+              </>
+            )}
 
             {/* Advanced Capture Options Panel */}
             <section
@@ -804,73 +1277,6 @@ export default function App() {
               </div>
             </section>
 
-            {/* Friendly Error Banner with Retry */}
-            {errorState && (
-              <section
-                role="alert"
-                className="rounded-xl border border-red-200 dark:border-red-900/60 bg-red-50/80 dark:bg-red-950/30 p-5"
-              >
-                <div className="flex flex-col sm:flex-row sm:items-start gap-3">
-                  <ShieldAlert className="h-5 w-5 text-red-600 dark:text-red-400 shrink-0 mt-0.5" />
-                  <div className="min-w-0 flex-1">
-                    <h2 className="text-sm font-semibold text-red-900 dark:text-red-200">
-                      {getFriendlyErrorTitle(errorState.code)}
-                    </h2>
-                    <p className="mt-1 text-sm text-red-700 dark:text-red-300">
-                      {errorState.message}
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2 shrink-0">
-                    {urlInput.trim() && (
-                      <button
-                        type="button"
-                        onClick={() => void executeCapture(urlInput)}
-                        className="inline-flex items-center gap-1.5 rounded-lg bg-red-600 hover:bg-red-500 px-3 py-1.5 text-xs font-semibold text-white transition-colors cursor-pointer"
-                      >
-                        <RotateCcw className="h-3.5 w-3.5" />
-                        <span>Retry Capture</span>
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      onClick={() => setErrorState(null)}
-                      className="rounded-lg px-2.5 py-1.5 text-xs font-medium text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/40 transition-colors cursor-pointer"
-                    >
-                      Dismiss
-                    </button>
-                  </div>
-                </div>
-              </section>
-            )}
-
-            {/* Live SSE Progress Bar */}
-            {progressEvent && progressEvent.stage !== 'error' && (
-              <ProgressPanel event={progressEvent} targetHostname={activeHostname} />
-            )}
-
-            {/* Capture Results Dashboard + Preview / Files / Diagnostics / AI Workspace */}
-            {progressEvent?.stage === 'ready' && activeJobId && (
-              <>
-                <ResultsDashboard stats={progressEvent.stats} hostname={activeHostname} />
-                <PreviewPanel
-                  jobId={activeJobId}
-                  siteTitle={siteTitle}
-                  hostname={activeHostname}
-                  zipFilename={zipFilename}
-                  event={progressEvent}
-                  files={capturedFiles}
-                  diagnostics={diagnostics}
-                  hasOriginalScreenshot={hasOriginalScreenshot}
-                  isDownloading={isDownloading}
-                  downloadComplete={downloadComplete}
-                  downloadError={downloadError}
-                  onDownload={() => void downloadZipByJobId(activeJobId, zipFilename)}
-                  onRecapture={() => void executeCapture(urlInput)}
-                  onWorkspaceUpdated={handleWorkspaceUpdated}
-                />
-              </>
-            )}
-
             {/* Compact Recent Downloads Strip */}
             {history.length > 0 && (
               <section className="pt-2">
@@ -956,17 +1362,14 @@ export default function App() {
               </p>
             </div>
 
-            {/* Column 2: Creator & Social Links */}
+            {/* Column 2: Social & Repository Links */}
             <div className="md:col-span-4 space-y-2.5">
               <div className="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
-                Creator
-              </div>
-              <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-                Mohammed Waqar Ahmed
+                Links
               </div>
               <div className="flex flex-wrap items-center gap-2.5 pt-0.5">
                 <a
-                  href="https://github.com/rehanwaqar"
+                  href="https://github.com/rehanwaqar/siteGrab"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-300 hover:border-sky-500/60 hover:text-sky-600 dark:hover:text-sky-400 transition-colors"
@@ -1031,7 +1434,7 @@ export default function App() {
 
           <div className="border-t border-slate-200/80 dark:border-slate-800/70 pt-4 flex flex-col sm:flex-row items-center justify-between gap-2 text-[11px] text-slate-500 dark:text-slate-500">
             <span>
-              Built by Mohammed Waqar Ahmed · Have an idea to improve SiteGrab?{' '}
+              Have an idea to improve SiteGrab?{' '}
               <button
                 type="button"
                 onClick={() => {

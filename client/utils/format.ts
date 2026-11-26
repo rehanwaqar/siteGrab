@@ -37,17 +37,28 @@ export function getFriendlyErrorTitle(errorCode?: string): string {
     case 'ROBOTS_DISALLOWED':
       return 'Blocked by robots.txt';
     case 'MISSING_CHROMIUM':
-      return 'Chromium Browser Not Installed';
+      return 'Server Browser Not Installed';
     case 'SIZE_LIMIT_EXCEEDED':
-      return 'Site Exceeds 100 MB Limit';
+      return 'Exceeds Size Limit';
     case 'FILE_LIMIT_EXCEEDED':
-      return 'Site Exceeds 500 File Limit';
+      return 'Exceeds 500 File Limit';
     case 'TIMEOUT':
-      return 'Capture Timed Out (60s)';
+      return 'Page Load Timed Out';
+    case 'ACCESS_DENIED':
+      return 'Access Denied (HTTP 401 / 403)';
+    case 'PRIVATE_SITE':
+      return 'Private Preview or Protected Site';
+    case 'NETWORK_ERROR':
+      return 'Network Connection Error';
     case 'RATE_LIMITED':
       return 'Rate Limit Reached';
     case 'NAVIGATION_ERROR':
       return 'Unable to Load Page';
+    case 'INVALID_ZIP':
+    case 'UNSAFE_ZIP_PATH':
+      return 'Invalid or Unsafe ZIP Archive';
+    case 'INVALID_IMAGE':
+      return 'Invalid Screenshot Image';
     default:
       return 'Capture Failed';
   }

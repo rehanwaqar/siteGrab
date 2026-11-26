@@ -8,6 +8,7 @@ import {
   type Request as PwRequest,
   type Response as PwResponse,
 } from 'playwright';
+import * as cheerio from 'cheerio';
 import { formatCapturedCode } from './formatter.ts';
 import {
   normalizeUrlKey,
@@ -17,7 +18,12 @@ import {
 } from './rewriter.ts';
 import { fetchRobotsPolicy, isAllowedByRobots } from './robots.ts';
 import { recoverSourceMaps } from './sourcemap.ts';
-import { isBlockedIp, SsrfValidationError, validateExternalUrl } from './ssrf.ts';
+import {
+  isBlockedIp,
+  safeFetchWithRedirectValidation,
+  SsrfValidationError,
+  validateExternalUrl,
+} from './ssrf.ts';
 import type {
   CaptureJob,
   CapturedAsset,
@@ -52,6 +58,28 @@ interface CapturedPage {
   localRelPath: string;
   html: string;
   title: string;
+}
+
+const PRIVATE_PREVIEW_HOST_RE =
+  /(webcontainer\.io|stackblitz\.io|bolt\.new|lovable\.dev|lovableproject\.com|codesandbox\.io|replit\.dev|gitpod\.io|ngrok-free\.app|ngrok\.io)$/i;
+
+const LOGIN_REDIRECT_RE = /\/(login|signin|sign-in|auth|oauth|sso)(\/|$|\?)/i;
+
+function isPrivateOrAuthHost(urlStr: string): boolean {
+  try {
+    const u = new URL(urlStr);
+    if (PRIVATE_PREVIEW_HOST_RE.test(u.hostname)) return true;
+    if (
+      u.hostname.includes('accounts.google.com') ||
+      u.hostname.includes('auth0.com') ||
+      u.hostname.includes('login.microsoftonline.com')
+    ) {
+      return true;
+    }
+    return LOGIN_REDIRECT_RE.test(u.pathname);
+  } catch {
+    return false;
+  }
 }
 
 const SKIP_LINK_EXTS = new Set([
@@ -255,10 +283,16 @@ export async function runCaptureJob(
   const abortController = new AbortController();
   let timedOut = false;
 
+  const effectiveTimeoutMs = Math.max(15_000, Math.min(120_000, job.options.timeoutMs ?? JOB_TIMEOUT_MS));
+  const waitStrategy =
+    job.options.waitStrategy === 'networkidle' || job.options.waitStrategy === 'domcontentloaded'
+      ? job.options.waitStrategy
+      : 'load';
+
   const jobTimer = setTimeout(() => {
     timedOut = true;
     abortController.abort();
-  }, JOB_TIMEOUT_MS);
+  }, effectiveTimeoutMs);
 
   let browser: Browser | null = null;
   let context: BrowserContext | null = null;
@@ -283,7 +317,8 @@ export async function runCaptureJob(
 
   const checkAborted = () => {
     if (timedOut) {
-      throw new CaptureError('TIMEOUT', 'Capture timed out after 60 seconds.');
+      const secs = Math.round(effectiveTimeoutMs / 1000);
+      throw new CaptureError('TIMEOUT', `Capture timed out after ${secs} seconds.`);
     }
     if (abortController.signal.aborted) {
       throw new CaptureError('ABORTED', 'Capture job was aborted.');
@@ -370,6 +405,10 @@ export async function runCaptureJob(
         'sec-ch-ua-platform': isMobile ? '"Android"' : '"Linux"',
       },
       ignoreHTTPSErrors: false,
+    });
+
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
 
     // Enforce SSRF protection + optional image/font exclusions on every network request
@@ -482,7 +521,10 @@ export async function runCaptureJob(
           if (!job.options.includeImages && category === 'images') return;
           if (!job.options.includeFonts && category === 'fonts') return;
 
-          const body = await response.body().catch(() => null);
+          const body = await Promise.race([
+            response.body().catch(() => null),
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), 4500)),
+          ]);
           if (!body || body.length === 0) return;
 
           if (totalFiles + 1 > MAX_FILES) {
@@ -564,36 +606,201 @@ export async function runCaptureJob(
         current.url,
       );
 
+      const pageGotoTimeout = effectiveTimeoutMs > 60_000 ? 40_000 : 18_000;
       let mainResponse: PwResponse | null = null;
       try {
         mainResponse = await page.goto(current.url, {
-          waitUntil: 'networkidle',
-          timeout: 22000,
+          waitUntil: waitStrategy,
+          timeout: pageGotoTimeout,
         });
       } catch (err) {
+        // Automatic fast fallback to domcontentloaded if 'load' or 'networkidle' timed out
+        if (waitStrategy !== 'domcontentloaded' && String(err).toLowerCase().includes('timeout')) {
+          try {
+            mainResponse = await page.goto(current.url, {
+              waitUntil: 'domcontentloaded',
+              timeout: 12_000,
+            });
+          } catch {
+            // Fall through to readyState check
+          }
+        }
         const readyState = await page.evaluate(() => document.readyState).catch(() => '');
         if (!readyState || (readyState !== 'interactive' && readyState !== 'complete')) {
-          if (pages.length === 0) {
+          if (pages.length === 0 && !mainResponse) {
+            const rawMsg = err instanceof Error ? err.message : 'Navigation failed';
+            if (rawMsg.toLowerCase().includes('timeout')) {
+              throw new CaptureError(
+                'TIMEOUT',
+                `Page navigation timed out using the "${waitStrategy}" strategy (${Math.round(pageGotoTimeout / 1000)}s limit).`,
+              );
+            }
+            if (rawMsg.includes('ERR_NAME_NOT_RESOLVED')) {
+              throw new CaptureError(
+                'DNS_ERROR',
+                `Domain "${currentParsed.hostname}" could not be resolved. Check the URL spelling or DNS availability.`,
+              );
+            }
+            if (isPrivateOrAuthHost(current.url) && (rawMsg.includes('ERR_CONNECTION') || rawMsg.includes('ERR_ABORTED'))) {
+              throw new CaptureError(
+                'PRIVATE_SITE',
+                `This looks like a private workspace preview URL (${currentParsed.hostname}) that cannot be fetched externally.`,
+              );
+            }
+            if (rawMsg.includes('net::ERR_')) {
+              throw new CaptureError(
+                'NETWORK_ERROR',
+                `Network error loading "${current.url}": ${rawMsg.split('\n')[0]}`,
+              );
+            }
             throw new CaptureError(
               'NAVIGATION_ERROR',
-              `Could not load "${current.url}": ${err instanceof Error ? err.message : 'Navigation failed'}`,
+              `Could not load "${current.url}": ${rawMsg.split('\n')[0]}`,
             );
           }
-          continue;
+          if (!mainResponse) continue;
         }
       }
 
+      const landedUrl = page.url();
+      let httpFallbackUsed = false;
       if (pages.length === 0 && mainResponse && mainResponse.status() >= 400) {
         const status = mainResponse.status();
-        if (status === 403 || status === 401) {
+        if (status === 401 || status === 403) {
+          if (isPrivateOrAuthHost(current.url) || isPrivateOrAuthHost(landedUrl)) {
+            throw new CaptureError(
+              'PRIVATE_SITE',
+              `Target site returned HTTP ${status} and appears to be a private preview or login-protected workspace.`,
+            );
+          }
+
+          // Try SSRF-validated standard HTTP fetch in case only headless Chromium TLS fingerprint was rejected
+          let fallbackRecovered = false;
+          try {
+            const { response: fbRes, finalUrl: fbUrl } = await safeFetchWithRedirectValidation(
+              current.url,
+              {
+                headers: {
+                  'User-Agent':
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
+                  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                  'Accept-Language': 'en-US,en;q=0.9',
+                },
+              },
+              5,
+              validatedHostCache,
+            );
+            const fbCt = (fbRes.headers.get('content-type') || '').toLowerCase();
+            if (fbRes.ok && fbCt.includes('text/html') && !isPrivateOrAuthHost(fbUrl)) {
+              const fbHtml = await fbRes.text();
+              const looksLikeChallenge =
+                fbRes.headers.get('cf-mitigated') === 'challenge' ||
+                /Just a moment\.\.\.|Enable JavaScript and cookies to continue/i.test(fbHtml);
+              if (fbHtml.trim().length > 80 && !looksLikeChallenge) {
+                const fbOrigin = new URL(fbUrl).origin;
+                const $fb = cheerio.load(fbHtml);
+                const subAssetTargets: Array<{ url: string; resourceType: string }> = [];
+                $fb('link[rel="stylesheet"][href], script[src], img[src]').each((_, el) => {
+                  if (subAssetTargets.length >= 60) return;
+                  const rawRef = ($fb(el).attr('href') || $fb(el).attr('src') || '').trim();
+                  if (!rawRef || rawRef.startsWith('data:') || rawRef.startsWith('blob:')) return;
+                  try {
+                    const resolved = new URL(rawRef, fbUrl);
+                    if (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') return;
+                    const tag = 'tagName' in el ? el.tagName?.toLowerCase() : '';
+                    const rType = tag === 'link' ? 'stylesheet' : tag === 'script' ? 'script' : 'image';
+                    if (rType === 'image' && !job.options.includeImages) return;
+                    subAssetTargets.push({ url: resolved.toString(), resourceType: rType });
+                  } catch {
+                    // Skip invalid asset URL
+                  }
+                });
+
+                await Promise.allSettled(
+                  subAssetTargets.map(async (item) => {
+                    try {
+                      const { response: aRes, finalUrl: aFinal } =
+                        await safeFetchWithRedirectValidation(item.url, {}, 3, validatedHostCache);
+                      if (!aRes.ok) return;
+                      const aNorm = normalizeUrlKey(aFinal);
+                      if (assets.has(aNorm)) return;
+                      const aCt = aRes.headers.get('content-type') || '';
+                      const cat = classifyAsset(aFinal, aCt, item.resourceType);
+                      if (!cat) return;
+                      const arrBuf = await aRes.arrayBuffer();
+                      const buf = Buffer.from(arrBuf);
+                      if (buf.length === 0 || totalFiles + 1 > MAX_FILES || totalBytes + buf.length > MAX_TOTAL_BYTES) {
+                        return;
+                      }
+                      const localRelPath = buildAssetRelPath(aFinal, cat, aCt, usedPaths);
+                      totalFiles += 1;
+                      totalBytes += buf.length;
+                      assets.set(aNorm, {
+                        originalUrl: aFinal,
+                        normalizedUrl: aNorm,
+                        localRelPath,
+                        category: cat,
+                        contentType: aCt,
+                        buffer: buf,
+                      });
+                      if (cat === 'css') stats.cssCount += 1;
+                      else if (cat === 'js') stats.jsCount += 1;
+                      else if (cat === 'images') stats.imagesCount += 1;
+                      else if (cat === 'fonts') stats.fontsCount += 1;
+                      else stats.otherAssetsCount += 1;
+                      stats.assetsCaptured = assets.size;
+                      stats.totalBytes = totalBytes;
+                    } catch {
+                      // Ignore individual asset fetch failures
+                    }
+                  }),
+                );
+
+                const localRelPath = buildPageRelPath(fbUrl, entryNormalized, usedPaths);
+                const htmlBytes = Buffer.byteLength(fbHtml, 'utf8');
+                if (consumeBudget(htmlBytes, 1)) {
+                  const title = $fb('title').first().text().trim() || new URL(fbUrl).hostname || fbOrigin;
+                  pages.push({
+                    originalUrl: fbUrl,
+                    normalizedUrl: normalizeUrlKey(fbUrl),
+                    localRelPath,
+                    html: fbHtml,
+                    title,
+                  });
+                  job.siteTitle = title;
+                  stats.pagesCaptured = pages.length;
+                  stats.htmlCount = pages.length;
+                  fallbackRecovered = true;
+                  httpFallbackUsed = true;
+                }
+              }
+            }
+          } catch {
+            // Fall through to ACCESS_DENIED
+          }
+
+          if (!fallbackRecovered) {
+            throw new CaptureError(
+              'ACCESS_DENIED',
+              `Target site returned HTTP ${status}. Its firewall, bot protection, or access controls denied the request.`,
+            );
+          }
+        } else {
           throw new CaptureError(
             'NAVIGATION_ERROR',
-            `Target site returned HTTP ${status}. Its CDN, firewall, or bot protection may be blocking cloud server IPs, or the page requires login.`,
+            `Target site returned HTTP ${status} (${mainResponse.statusText() || 'Error'}).`,
           );
         }
+      }
+
+      if (httpFallbackUsed) {
+        break;
+      }
+
+      if (pages.length === 0 && !isPrivateOrAuthHost(current.url) && isPrivateOrAuthHost(landedUrl)) {
         throw new CaptureError(
-          'NAVIGATION_ERROR',
-          `Target site returned HTTP ${status} (${mainResponse.statusText() || 'Error'}).`,
+          'PRIVATE_SITE',
+          `Target site redirected to a login or authentication page (${new URL(landedUrl).hostname}). SiteGrab does not bypass authentication.`,
         );
       }
 
@@ -601,22 +808,22 @@ export async function runCaptureJob(
       if (fatalLimitError) throw fatalLimitError;
 
       // Verify final URL after any client/server redirects
-      const finalPageUrl = page.url();
+      const finalPageUrl = landedUrl;
       await validateExternalUrl(finalPageUrl, validatedHostCache);
 
-      // Scroll page incrementally to trigger lazy-loaded images & chunks
+      // Scroll page quickly to trigger lazy-loaded images & chunks
       await page.evaluate(async () => {
-        const scrollStep = Math.max(350, Math.floor(window.innerHeight * 0.8));
-        const maxScroll = Math.min(document.body.scrollHeight || 0, 18000);
+        const scrollStep = Math.max(700, Math.floor(window.innerHeight));
+        const maxScroll = Math.min(document.body.scrollHeight || 0, 9000);
         for (let y = 0; y <= maxScroll; y += scrollStep) {
           window.scrollTo(0, y);
-          await new Promise((r) => setTimeout(r, 140));
+          await new Promise((r) => setTimeout(r, 65));
         }
         window.scrollTo(0, 0);
       });
 
-      await page.waitForLoadState('networkidle', { timeout: 3500 }).catch(() => {});
-      await new Promise((r) => setTimeout(r, 250));
+      await page.waitForLoadState('networkidle', { timeout: 1500 }).catch(() => {});
+      await new Promise((r) => setTimeout(r, 120));
       await Promise.allSettled(pendingAssetReads.splice(0));
 
       checkAborted();
@@ -897,7 +1104,8 @@ export async function runCaptureJob(
       throw new CaptureError(err.code, err.message);
     }
     if (timedOut) {
-      throw new CaptureError('TIMEOUT', 'Capture timed out after 60 seconds.');
+      const secs = Math.round(effectiveTimeoutMs / 1000);
+      throw new CaptureError('TIMEOUT', `Capture timed out after ${secs} seconds.`);
     }
     throw new CaptureError(
       'CAPTURE_FAILED',

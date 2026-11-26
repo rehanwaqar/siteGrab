@@ -129,17 +129,13 @@ export function FeedbackView() {
               Help make SiteGrab better
             </h1>
             <p className="mt-2 text-sm text-slate-600 dark:text-slate-400 leading-relaxed">
-              Built by{' '}
-              <span className="font-semibold text-slate-900 dark:text-slate-200">
-                Mohammed Waqar Ahmed
-              </span>
-              . Share how your capture experience went, report edge cases, or suggest new features to improve the workflow.
+              Share how your capture experience went, report edge cases, or suggest new features to improve the workflow.
             </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5 shrink-0">
             <a
-              href="https://github.com/rehanwaqar"
+              href="https://github.com/rehanwaqar/siteGrab"
               target="_blank"
               rel="noopener noreferrer"
               className="inline-flex items-center gap-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-[#0B0F17] px-3.5 py-2 text-xs font-medium text-slate-700 dark:text-slate-200 hover:border-sky-500/60 hover:text-sky-600 dark:hover:text-sky-400 transition-colors"

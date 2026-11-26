@@ -33,6 +33,7 @@ interface PreviewPanelProps {
   diagnostics: DiagnosticReport;
   hasOriginalScreenshot: boolean;
   isDownloading: boolean;
+  downloadPercent?: number | null;
   downloadComplete: boolean;
   downloadError: string | null;
   onDownload: () => void;
@@ -56,6 +57,7 @@ export function PreviewPanel({
   diagnostics,
   hasOriginalScreenshot,
   isDownloading,
+  downloadPercent,
   downloadComplete,
   downloadError,
   onDownload,
@@ -235,9 +237,11 @@ export function PreviewPanel({
             ) : (
               <Download className="h-3.5 w-3.5 shrink-0" />
             )}
-            <span>
+            <span className="tabular-nums">
               {isDownloading
-                ? 'Downloading...'
+                ? typeof downloadPercent === 'number'
+                  ? `Downloading ${downloadPercent}%...`
+                  : 'Downloading...'
                 : downloadComplete
                   ? 'Download ZIP Again'
                   : 'Download ZIP'}

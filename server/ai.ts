@@ -23,7 +23,20 @@ export class AiServiceError extends Error {
   }
 }
 
-const EDITABLE_EXTENSIONS = new Set(['.html', '.htm', '.css', '.js', '.mjs', '.json', '.md']);
+const EDITABLE_EXTENSIONS = new Set([
+  '.html',
+  '.htm',
+  '.css',
+  '.js',
+  '.mjs',
+  '.ts',
+  '.tsx',
+  '.jsx',
+  '.json',
+  '.md',
+  '.txt',
+  '.svg',
+]);
 const MAX_SINGLE_FILE_CHARS = 32_000;
 const MAX_TOTAL_CONTEXT_CHARS = 75_000;
 
@@ -88,7 +101,12 @@ async function gatherProjectContext(
     if (prioritized.length >= 6) break;
     if (
       !prioritized.includes(f.path) &&
-      (f.path.endsWith('.css') || f.path.endsWith('.html') || f.path.endsWith('.js')) &&
+      (f.path.endsWith('.css') ||
+        f.path.endsWith('.html') ||
+        f.path.endsWith('.js') ||
+        f.path.endsWith('.tsx') ||
+        f.path.endsWith('.jsx') ||
+        f.path.endsWith('.ts')) &&
       !f.path.startsWith('recovered-src/')
     ) {
       prioritized.push(f.path);

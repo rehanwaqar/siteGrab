@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import express, { type Express, type Request, type Response } from 'express';
+import express, { type Express, type NextFunction, type Request, type Response } from 'express';
 import { chromium } from 'playwright';
 import {
   AiServiceError,
@@ -27,7 +27,15 @@ import type {
   CaptureStage,
   CaptureStats,
   ProgressEvent,
+  WaitStrategy,
 } from './types.ts';
+import {
+  detectImageMimeType,
+  generateWebsiteFromScreenshot,
+  MAX_UPLOAD_SCREENSHOT_BYTES,
+  ScreenshotGenError,
+} from './screenshotGen.ts';
+import { MAX_UPLOAD_ZIP_BYTES, processImportedZip, ZipImportError } from './zipImport.ts';
 import { createZipArchive, listDirectoryFiles } from './zipper.ts';
 
 const JOB_TTL_MS = 15 * 60 * 1000; // 15 minutes retention for preview, AI editing, and ZIP download
@@ -66,6 +74,8 @@ export function createSiteGrabServer(): Express {
 
   const jobs = new Map<string, CaptureJob>();
   const rateLimiter = new IpRateLimiter(5, 10 * 60 * 1000);
+  const zipImportLimiter = new IpRateLimiter(10, 10 * 60 * 1000);
+  const screenshotLimiter = new IpRateLimiter(8, 10 * 60 * 1000);
   const feedbackLimiter = new IpRateLimiter(10, 10 * 60 * 1000);
 
   async function cleanupJobFiles(job: CaptureJob): Promise<void> {
@@ -82,6 +92,8 @@ export function createSiteGrabServer(): Express {
   const sweepTimer = setInterval(() => {
     const now = Date.now();
     rateLimiter.prune();
+    zipImportLimiter.prune();
+    screenshotLimiter.prune();
     feedbackLimiter.prune();
     for (const [id, job] of jobs.entries()) {
       if (now > job.expiresAt) {
@@ -175,6 +187,17 @@ export function createSiteGrabServer(): Express {
       return;
     }
 
+    const rawWaitStrategy = body?.waitStrategy;
+    const waitStrategy: WaitStrategy =
+      rawWaitStrategy === 'networkidle' || rawWaitStrategy === 'domcontentloaded'
+        ? rawWaitStrategy
+        : 'load';
+
+    const requestedTimeout = Number(body?.timeoutMs ?? 60_000);
+    const timeoutMs = Number.isFinite(requestedTimeout)
+      ? Math.max(15_000, Math.min(120_000, requestedTimeout))
+      : 60_000;
+
     const options: CaptureOptions = {
       url: parsedUrl.toString(),
       crawlDepth: Math.max(0, Math.min(3, Number(body?.crawlDepth ?? 0) || 0)),
@@ -187,6 +210,8 @@ export function createSiteGrabServer(): Express {
       mobileViewport: body?.mobileViewport === true,
       saveScreenshots: body?.saveScreenshots === true,
       preserveInternalNav: body?.preserveInternalNav !== false,
+      timeoutMs,
+      waitStrategy,
     };
 
     const jobId = crypto.randomUUID();
@@ -300,6 +325,299 @@ export function createSiteGrabServer(): Express {
     });
   });
 
+  // Upload & extract an authorized website ZIP (Bolt, Lovable, etc.) using SiteGrab processing
+  app.post(
+    '/api/capture/import-zip',
+    express.raw({
+      type: ['application/zip', 'application/x-zip-compressed', 'application/octet-stream'],
+      limit: `${MAX_UPLOAD_ZIP_BYTES}b`,
+    }),
+    async (req: Request, res: Response) => {
+      const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+      const limitResult = zipImportLimiter.check(clientIp);
+      if (!limitResult.allowed) {
+        res.setHeader('Retry-After', String(limitResult.retryAfterSeconds));
+        res.status(429).json({
+          errorCode: 'RATE_LIMITED',
+          error: `ZIP import limit reached. Please wait ${limitResult.retryAfterSeconds} seconds before uploading again.`,
+        });
+        return;
+      }
+
+      if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+        res.status(400).json({
+          errorCode: 'INVALID_ZIP',
+          error: 'No ZIP file received. Please select a valid .zip archive.',
+        });
+        return;
+      }
+
+      const rawName = String(req.get('x-zip-filename') || 'imported-site.zip');
+      const safeOriginalName =
+        path
+          .basename(rawName)
+          .replace(/[^a-zA-Z0-9._-]/g, '_')
+          .slice(0, 80) || 'imported-site.zip';
+      const baseSlug =
+        safeOriginalName.replace(/\.zip$/i, '').replace(/[^a-zA-Z0-9.-]/g, '-') || 'imported-site';
+
+      const jobId = crypto.randomUUID();
+      const tempRoot = path.join(os.tmpdir(), `sitegrab-${jobId}`);
+      const siteDir = path.join(tempRoot, 'site');
+      const zipFilename = `sitegrab-${baseSlug}.zip`;
+      const zipPath = path.join(tempRoot, zipFilename);
+
+      const options: CaptureOptions = {
+        url: `zip://${safeOriginalName}`,
+        crawlDepth: 0,
+        maxPages: 1,
+        formatCode: req.get('x-format-code') !== 'false',
+        recoverSourceMaps: false,
+        respectRobots: true,
+        includeImages: req.get('x-include-images') !== 'false',
+        includeFonts: req.get('x-include-fonts') !== 'false',
+        mobileViewport: false,
+        saveScreenshots: false,
+        preserveInternalNav: req.get('x-preserve-nav') !== 'false',
+      };
+
+      const stats: CaptureStats = {
+        pagesCaptured: 0,
+        assetsCaptured: 0,
+        htmlCount: 0,
+        cssCount: 0,
+        jsCount: 0,
+        imagesCount: 0,
+        fontsCount: 0,
+        otherAssetsCount: 0,
+        totalBytes: 0,
+        sourceMapsRecovered: 0,
+        skippedRobots: 0,
+        failedAssetsCount: 0,
+        screenshotsCount: 0,
+        durationMs: 0,
+      };
+
+      const readyEvent: ProgressEvent = {
+        jobId,
+        stage: 'ready',
+        message: 'ZIP project extracted and ready for preview, AI inspection, or download.',
+        percent: 100,
+        stats,
+      };
+
+      const job: CaptureJob = {
+        id: jobId,
+        url: options.url,
+        hostname: baseSlug,
+        siteTitle: baseSlug,
+        options,
+        status: 'ready',
+        lastEvent: readyEvent,
+        tempRoot,
+        siteDir,
+        zipPath,
+        zipFilename,
+        originalScreenshotPath: path.join(tempRoot, '_original-preview.png'),
+        hasOriginalScreenshot: false,
+        files: [],
+        diagnostics: {
+          brokenImages: [],
+          failedResources: [],
+          unresolvedLinks: [],
+        },
+        createdAt: Date.now(),
+        expiresAt: Date.now() + JOB_TTL_MS,
+        cleaned: false,
+        subscribers: new Set(),
+      };
+
+      try {
+        await processImportedZip({
+          zipBuffer: req.body,
+          originalZipName: safeOriginalName,
+          job,
+          stats,
+        });
+        job.lastEvent = {
+          ...readyEvent,
+          stats: { ...stats },
+          files: job.files,
+          diagnostics: job.diagnostics,
+          hasOriginalScreenshot: false,
+        };
+        jobs.set(jobId, job);
+        res.status(201).json({
+          jobId,
+          url: job.url,
+          hostname: job.hostname,
+          siteTitle: job.siteTitle,
+          zipFilename: job.zipFilename,
+          event: job.lastEvent,
+        });
+      } catch (err) {
+        await cleanupJobFiles(job);
+        if (err instanceof ZipImportError) {
+          res.status(err.statusCode).json({ errorCode: err.code, error: err.message });
+          return;
+        }
+        res.status(500).json({
+          errorCode: 'INVALID_ZIP',
+          error: 'Could not extract the uploaded ZIP archive.',
+        });
+      }
+    },
+  );
+
+  // Generate a complete static website & VS Code ZIP directly from a website screenshot
+  app.post(
+    '/api/capture/from-screenshot',
+    express.raw({
+      type: ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/octet-stream'],
+      limit: `${MAX_UPLOAD_SCREENSHOT_BYTES}b`,
+    }),
+    async (req: Request, res: Response) => {
+      const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+      const limitResult = screenshotLimiter.check(clientIp);
+      if (!limitResult.allowed) {
+        res.setHeader('Retry-After', String(limitResult.retryAfterSeconds));
+        res.status(429).json({
+          errorCode: 'RATE_LIMITED',
+          error: `Screenshot generation limit reached. Please wait ${limitResult.retryAfterSeconds} seconds before uploading again.`,
+        });
+        return;
+      }
+
+      if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+        res.status(400).json({
+          errorCode: 'INVALID_IMAGE',
+          error: 'No screenshot image received. Please upload a PNG, JPEG, WebP, or GIF image.',
+        });
+        return;
+      }
+
+      const rawName = String(req.get('x-screenshot-filename') || 'screenshot.png');
+      const safeOriginalName =
+        path
+          .basename(rawName)
+          .replace(/[^a-zA-Z0-9._-]/g, '_')
+          .slice(0, 80) || 'screenshot.png';
+      const baseSlug =
+        safeOriginalName
+          .replace(/\.(png|jpe?g|webp|gif)$/i, '')
+          .replace(/[^a-zA-Z0-9.-]/g, '-') || 'screenshot-site';
+
+      const notes = String(req.get('x-screenshot-notes') || '').slice(0, 1200);
+
+      const jobId = crypto.randomUUID();
+      const tempRoot = path.join(os.tmpdir(), `sitegrab-${jobId}`);
+      const siteDir = path.join(tempRoot, 'site');
+      const zipFilename = `sitegrab-${baseSlug}.zip`;
+      const zipPath = path.join(tempRoot, zipFilename);
+
+      const options: CaptureOptions = {
+        url: `screenshot://${safeOriginalName}`,
+        crawlDepth: 0,
+        maxPages: 1,
+        formatCode: req.get('x-format-code') !== 'false',
+        recoverSourceMaps: false,
+        respectRobots: true,
+        includeImages: true,
+        includeFonts: true,
+        mobileViewport: false,
+        saveScreenshots: false,
+        preserveInternalNav: true,
+      };
+
+      const stats: CaptureStats = {
+        pagesCaptured: 0,
+        assetsCaptured: 0,
+        htmlCount: 0,
+        cssCount: 0,
+        jsCount: 0,
+        imagesCount: 0,
+        fontsCount: 0,
+        otherAssetsCount: 0,
+        totalBytes: 0,
+        sourceMapsRecovered: 0,
+        skippedRobots: 0,
+        failedAssetsCount: 0,
+        screenshotsCount: 0,
+        durationMs: 0,
+      };
+
+      const readyEvent: ProgressEvent = {
+        jobId,
+        stage: 'ready',
+        message: 'Website generated from screenshot and ready for preview, AI refinement, or ZIP download.',
+        percent: 100,
+        stats,
+      };
+
+      const job: CaptureJob = {
+        id: jobId,
+        url: options.url,
+        hostname: baseSlug,
+        siteTitle: baseSlug,
+        options,
+        status: 'ready',
+        lastEvent: readyEvent,
+        tempRoot,
+        siteDir,
+        zipPath,
+        zipFilename,
+        originalScreenshotPath: path.join(tempRoot, '_original-preview.png'),
+        hasOriginalScreenshot: false,
+        files: [],
+        diagnostics: {
+          brokenImages: [],
+          failedResources: [],
+          unresolvedLinks: [],
+        },
+        createdAt: Date.now(),
+        expiresAt: Date.now() + JOB_TTL_MS,
+        cleaned: false,
+        subscribers: new Set(),
+      };
+
+      try {
+        await generateWebsiteFromScreenshot({
+          imageBuffer: req.body,
+          originalFilename: safeOriginalName,
+          notes,
+          job,
+          stats,
+        });
+        job.lastEvent = {
+          ...readyEvent,
+          stats: { ...stats },
+          files: job.files,
+          diagnostics: job.diagnostics,
+          hasOriginalScreenshot: job.hasOriginalScreenshot,
+        };
+        jobs.set(jobId, job);
+        res.status(201).json({
+          jobId,
+          url: job.url,
+          hostname: job.hostname,
+          siteTitle: job.siteTitle,
+          zipFilename: job.zipFilename,
+          event: job.lastEvent,
+        });
+      } catch (err) {
+        await cleanupJobFiles(job);
+        if (err instanceof ScreenshotGenError) {
+          res.status(err.statusCode).json({ errorCode: err.code, error: err.message });
+          return;
+        }
+        res.status(500).json({
+          errorCode: 'CAPTURE_FAILED',
+          error: 'Could not generate website from the uploaded screenshot.',
+        });
+      }
+    },
+  );
+
   app.get('/api/capture/:jobId/events', (req: Request, res: Response) => {
     const job = jobs.get(String(req.params.jobId));
     if (!job) {
@@ -356,10 +674,11 @@ export function createSiteGrabServer(): Express {
       return;
     }
     try {
-      await fsp.access(job.originalScreenshotPath);
-      res.setHeader('Content-Type', 'image/png');
+      const buf = await fsp.readFile(job.originalScreenshotPath);
+      const mime = detectImageMimeType(buf) || 'image/png';
+      res.setHeader('Content-Type', mime);
       res.setHeader('Cache-Control', 'no-store');
-      fs.createReadStream(job.originalScreenshotPath).pipe(res);
+      res.send(buf);
     } catch {
       res.status(404).send('Original screenshot not found.');
     }
@@ -645,6 +964,25 @@ export function createSiteGrabServer(): Express {
     await cleanupJobFiles(job);
     jobs.delete(jobId);
     res.json({ ok: true });
+  });
+
+  app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
+    if (
+      err &&
+      typeof err === 'object' &&
+      'type' in err &&
+      (err as { type?: string }).type === 'entity.too.large'
+    ) {
+      const isShot = req.path.includes('from-screenshot');
+      res.status(413).json({
+        errorCode: 'SIZE_LIMIT_EXCEEDED',
+        error: isShot
+          ? 'Uploaded screenshot exceeds the 10 MB upload limit.'
+          : 'Uploaded ZIP exceeds the 50 MB upload limit.',
+      });
+      return;
+    }
+    next(err);
   });
 
   return app;
