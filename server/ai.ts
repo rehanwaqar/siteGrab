@@ -64,6 +64,8 @@ function getGeminiClient(): GoogleGenAI {
 }
 
 export function isEditableTextFile(relPath: string): boolean {
+  const base = path.posix.basename(relPath).toLowerCase();
+  if (base === '.gitignore') return true;
   const ext = path.posix.extname(relPath).toLowerCase();
   return EDITABLE_EXTENSIONS.has(ext);
 }

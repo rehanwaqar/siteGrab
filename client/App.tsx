@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
+import { onAuthStateChanged, type User } from 'firebase/auth';
 import {
   AlertTriangle,
+  BookOpen,
   Download,
   ExternalLink,
   FileArchive,
@@ -9,6 +11,7 @@ import {
   Image as ImageIcon,
   Linkedin,
   Loader2,
+  LogOut,
   MessageSquarePlus,
   Moon,
   RotateCcw,
@@ -16,13 +19,27 @@ import {
   Sun,
   Upload,
 } from 'lucide-react';
+import { AccountModal } from './components/AccountModal';
+import { AuthGate } from './components/AuthGate';
 import { FailureRecoveryPanel, type RecoveryRetrySettings } from './components/FailureRecoveryPanel';
 import { FeedbackView } from './components/FeedbackView';
+import { GuideView } from './components/GuideView';
 import { HistoryView } from './components/HistoryView';
 import { PreviewPanel } from './components/PreviewPanel';
 import { ProgressPanel } from './components/ProgressPanel';
 import { ResultsDashboard } from './components/ResultsDashboard';
+import { SiteGrabLogo } from './components/SiteGrabLogo';
 import { TermsView } from './components/TermsView';
+import {
+  auth,
+  clearUserSnapshots,
+  getAuthHeaders,
+  saveUserSnapshot,
+  signOutAccount,
+  subscribeToUserSnapshots,
+  syncPreviewSessionCookie,
+  upsertUserProfile,
+} from './firebase';
 import type {
   ActiveView,
   CapturedFileEntry,
@@ -38,7 +55,6 @@ import {
   formatRelativeTime,
 } from './utils/format';
 
-const HISTORY_STORAGE_KEY = 'sitegrab_history_v1';
 const THEME_STORAGE_KEY = 'sitegrab_theme_v1';
 
 const EMPTY_DIAGNOSTICS: DiagnosticReport = {
@@ -46,17 +62,6 @@ const EMPTY_DIAGNOSTICS: DiagnosticReport = {
   failedResources: [],
   unresolvedLinks: [],
 };
-
-function loadHistory(): HistoryEntry[] {
-  try {
-    const raw = localStorage.getItem(HISTORY_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
 
 export default function App() {
   const [darkMode, setDarkMode] = useState<boolean>(() => {
@@ -80,7 +85,7 @@ export default function App() {
   const [mobileViewport, setMobileViewport] = useState<boolean>(false);
   const [saveScreenshots, setSaveScreenshots] = useState<boolean>(false);
   const [preserveInternalNav, setPreserveInternalNav] = useState<boolean>(true);
-  const [autoDownload, setAutoDownload] = useState<boolean>(true);
+  const [autoDownload, setAutoDownload] = useState<boolean>(false);
 
   const [chromiumMissing, setChromiumMissing] = useState<boolean>(false);
   const [isCapturing, setIsCapturing] = useState<boolean>(false);
@@ -102,14 +107,28 @@ export default function App() {
   const [quickUploadError, setQuickUploadError] = useState<string | null>(null);
   const [isProcessingUpload, setIsProcessingUpload] = useState<boolean>(false);
 
-  const [history, setHistory] = useState<HistoryEntry[]>(loadHistory);
+  const [authReady, setAuthReady] = useState<boolean>(false);
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [pendingVerificationUser, setPendingVerificationUser] = useState<User | null>(null);
+  const [showAccountModal, setShowAccountModal] = useState<boolean>(false);
+  const [, setProfileVersion] = useState<number>(0);
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
 
-  const eventSourceRef = useRef<EventSource | null>(null);
+  const currentUserRef = useRef<User | null>(null);
+  currentUserRef.current = currentUser;
+  const streamAbortRef = useRef<AbortController | null>(null);
   const urlInputRef = useRef<HTMLInputElement | null>(null);
   const quickShotInputRef = useRef<HTMLInputElement | null>(null);
   const quickZipInputRef = useRef<HTMLInputElement | null>(null);
   const autoDownloadRef = useRef<boolean>(autoDownload);
   autoDownloadRef.current = autoDownload;
+
+  const closeActiveStream = useCallback(() => {
+    if (streamAbortRef.current) {
+      streamAbortRef.current.abort();
+      streamAbortRef.current = null;
+    }
+  }, []);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -126,12 +145,67 @@ export default function App() {
   }, [darkMode]);
 
   useEffect(() => {
-    try {
-      localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(history.slice(0, 15)));
-    } catch {
-      // Ignore storage errors
-    }
-  }, [history]);
+    const unsubAuth = onAuthStateChanged(auth, (user) => {
+      if (user && user.emailVerified) {
+        setCurrentUser(user);
+        setPendingVerificationUser(null);
+        setAuthReady(true);
+        void syncPreviewSessionCookie();
+        void upsertUserProfile(user).catch((err) => {
+          console.error('Failed to sync user profile:', err);
+        });
+      } else {
+        closeActiveStream();
+        setCurrentUser(null);
+        setPendingVerificationUser(user ?? null);
+        setShowAccountModal(false);
+        setAuthReady(true);
+        setIsCapturing(false);
+        setIsProcessingUpload(false);
+        setActiveJobId(null);
+        setActiveHostname('');
+        setSiteTitle('');
+        setZipFilename('');
+        setCapturedFiles([]);
+        setDiagnostics(EMPTY_DIAGNOSTICS);
+        setHasOriginalScreenshot(false);
+        setProgressEvent(null);
+        setErrorState(null);
+        setDownloadComplete(false);
+        setDownloadError(null);
+        setHistory([]);
+      }
+    });
+
+    return () => {
+      unsubAuth();
+    };
+  }, [closeActiveStream]);
+
+  const handleVerificationComplete = useCallback(async (verifiedUser: User) => {
+    setPendingVerificationUser(null);
+    setCurrentUser(verifiedUser);
+    await syncPreviewSessionCookie();
+    await upsertUserProfile(verifiedUser).catch((err) => {
+      console.error('Failed to sync user profile after verification:', err);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!currentUser) return;
+    const unsubSnapshots = subscribeToUserSnapshots(
+      currentUser.uid,
+      (entries) => {
+        setHistory(entries);
+      },
+      (err) => {
+        console.error('Failed to subscribe to private snapshots:', err);
+      },
+    );
+    return () => {
+      unsubSnapshots();
+    };
+  }, [currentUser]);
 
   useEffect(() => {
     fetch('/api/health')
@@ -144,15 +218,15 @@ export default function App() {
       .catch(() => {});
 
     return () => {
-      eventSourceRef.current?.close();
+      closeActiveStream();
     };
-  }, []);
+  }, [closeActiveStream]);
 
-  const closeActiveStream = () => {
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
-      eventSourceRef.current = null;
-    }
+  const handleSignOut = async () => {
+    closeActiveStream();
+    setShowAccountModal(false);
+    setActiveView('capture');
+    await signOutAccount();
   };
 
   const downloadZipByJobId = useCallback(async (jobId: string, filename: string): Promise<boolean> => {
@@ -160,8 +234,10 @@ export default function App() {
     setDownloadPercent(0);
     setDownloadError(null);
     try {
+      const authHeaders = await getAuthHeaders();
       const res = await fetch(`/api/capture/${encodeURIComponent(jobId)}/download`, {
         cache: 'no-store',
+        headers: authHeaders,
       });
       if (!res.ok) {
         let errMsg = `Download failed (HTTP ${res.status}).`;
@@ -239,7 +315,11 @@ export default function App() {
     let resolvedHasShot = Boolean(event.hasOriginalScreenshot);
 
     try {
-      const statusRes = await fetch(`/api/capture/${encodeURIComponent(jobId)}/status`);
+      await syncPreviewSessionCookie();
+      const authHeaders = await getAuthHeaders();
+      const statusRes = await fetch(`/api/capture/${encodeURIComponent(jobId)}/status`, {
+        headers: authHeaders,
+      });
       if (statusRes.ok) {
         const statusData = (await statusRes.json()) as {
           siteTitle?: string;
@@ -265,6 +345,7 @@ export default function App() {
     setCapturedFiles(resolvedFiles);
     setDiagnostics(resolvedDiagnostics);
     setHasOriginalScreenshot(resolvedHasShot);
+    setProgressEvent(event);
 
     const newEntry: HistoryEntry = {
       id: jobId,
@@ -277,7 +358,12 @@ export default function App() {
       options: usedOptions,
     };
 
-    setHistory((prev) => [newEntry, ...prev.filter((item) => item.id !== jobId)].slice(0, 15));
+    const user = currentUserRef.current;
+    if (user) {
+      void saveUserSnapshot(user.uid, newEntry).catch((err) => {
+        console.error('Failed to persist snapshot to Firestore:', err);
+      });
+    }
 
     if (autoDownloadRef.current) {
       await downloadZipByJobId(jobId, resolvedZip);
@@ -323,9 +409,13 @@ export default function App() {
       setIsCapturing(true);
 
       try {
+        const authHeaders = await getAuthHeaders();
         const response = await fetch('/api/capture', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            ...authHeaders,
+          },
           body: JSON.stringify({
             url: normalizedInput,
             ...opts,
@@ -358,37 +448,69 @@ export default function App() {
         setSiteTitle(host);
         setZipFilename(`sitegrab-${host}.zip`);
 
-        const es = new EventSource(`/api/capture/${encodeURIComponent(jobId)}/events`);
-        eventSourceRef.current = es;
+        const controller = new AbortController();
+        streamAbortRef.current = controller;
 
-        es.onmessage = (msg) => {
-          try {
-            const evt = JSON.parse(msg.data) as ProgressEvent;
-            setProgressEvent(evt);
+        const streamHeaders = await getAuthHeaders();
+        const sseRes = await fetch(`/api/capture/${encodeURIComponent(jobId)}/events`, {
+          headers: streamHeaders,
+          signal: controller.signal,
+        });
 
-            if (evt.stage === 'ready') {
-              es.close();
-              eventSourceRef.current = null;
-              setIsCapturing(false);
-              void finalizeCapture(jobId, evt, resolvedUrl, host, opts);
-            } else if (evt.stage === 'error') {
-              es.close();
-              eventSourceRef.current = null;
-              setIsCapturing(false);
-              setErrorState({
-                code: evt.errorCode,
-                message: evt.message,
-              });
+        if (!sseRes.ok || !sseRes.body) {
+          throw new Error('Could not open capture progress stream.');
+        }
+
+        const reader = sseRes.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let finished = false;
+
+        while (!finished) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+
+          let sepIndex: number;
+          while ((sepIndex = buffer.indexOf('\n\n')) !== -1) {
+            const rawChunk = buffer.slice(0, sepIndex);
+            buffer = buffer.slice(sepIndex + 2);
+
+            const dataLine = rawChunk
+              .split('\n')
+              .find((line) => line.startsWith('data:'));
+            if (!dataLine) continue;
+
+            try {
+              const evt = JSON.parse(dataLine.slice(5).trim()) as ProgressEvent;
+              if (evt.stage === 'ready') {
+                finished = true;
+                controller.abort();
+                streamAbortRef.current = null;
+                setIsCapturing(false);
+                await finalizeCapture(jobId, evt, resolvedUrl, host, opts);
+                break;
+              } else if (evt.stage === 'error') {
+                finished = true;
+                controller.abort();
+                streamAbortRef.current = null;
+                setProgressEvent(evt);
+                setIsCapturing(false);
+                setErrorState({
+                  code: evt.errorCode,
+                  message: evt.message,
+                });
+                break;
+              } else {
+                setProgressEvent(evt);
+              }
+            } catch {
+              // Ignore malformed event line
             }
-          } catch {
-            // Ignore malformed event
           }
-        };
+        }
 
-        es.onerror = () => {
-          if (es.readyState === EventSource.CLOSED) return;
-          es.close();
-          eventSourceRef.current = null;
+        if (!finished && !controller.signal.aborted) {
           setIsCapturing(false);
           setErrorState((prev) =>
             prev ?? {
@@ -396,8 +518,11 @@ export default function App() {
               message: 'Lost live progress connection. Click Retry to try again.',
             },
           );
-        };
-      } catch {
+        }
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          return;
+        }
         setIsCapturing(false);
         setErrorState({
           code: 'NETWORK_ERROR',
@@ -406,6 +531,7 @@ export default function App() {
       }
     },
     [
+      closeActiveStream,
       crawlDepth,
       maxPages,
       formatCode,
@@ -444,9 +570,11 @@ export default function App() {
     setDownloadComplete(false);
     setDownloadError(null);
 
+    const authHeaders = await getAuthHeaders();
     const res = await fetch('/api/capture/import-zip', {
       method: 'POST',
       headers: {
+        ...authHeaders,
         'Content-Type': 'application/zip',
         'X-Zip-Filename': file.name,
         'X-Format-Code': String(formatCode),
@@ -470,6 +598,8 @@ export default function App() {
     if (!res.ok || !data.jobId || !data.event) {
       throw new Error(data.error || 'Could not extract the uploaded ZIP archive.');
     }
+
+    await syncPreviewSessionCookie();
 
     const host = data.hostname || 'imported-site';
     const resolvedZip = data.zipFilename || `sitegrab-${host}.zip`;
@@ -506,7 +636,12 @@ export default function App() {
         preserveInternalNav,
       },
     };
-    setHistory((prev) => [importedEntry, ...prev.filter((item) => item.id !== data.jobId)].slice(0, 15));
+    const user = currentUserRef.current;
+    if (user) {
+      void saveUserSnapshot(user.uid, importedEntry).catch((err) => {
+        console.error('Failed to persist ZIP snapshot to Firestore:', err);
+      });
+    }
 
     if (autoDownloadRef.current) {
       await downloadZipByJobId(data.jobId, resolvedZip);
@@ -546,7 +681,9 @@ export default function App() {
       },
     });
 
+    const authHeaders = await getAuthHeaders();
     const headers: Record<string, string> = {
+      ...authHeaders,
       'Content-Type': file.type || 'image/png',
       'X-Screenshot-Filename': file.name,
       'X-Format-Code': String(formatCode),
@@ -575,6 +712,8 @@ export default function App() {
       setProgressEvent(null);
       throw new Error(data.error || 'Could not generate website from the uploaded screenshot.');
     }
+
+    await syncPreviewSessionCookie();
 
     const host = data.hostname || 'screenshot-site';
     const resolvedZip = data.zipFilename || `sitegrab-${host}.zip`;
@@ -612,9 +751,12 @@ export default function App() {
         preserveInternalNav: true,
       },
     };
-    setHistory((prev) =>
-      [generatedEntry, ...prev.filter((item) => item.id !== data.jobId)].slice(0, 15),
-    );
+    const user = currentUserRef.current;
+    if (user) {
+      void saveUserSnapshot(user.uid, generatedEntry).catch((err) => {
+        console.error('Failed to persist screenshot snapshot to Firestore:', err);
+      });
+    }
 
     if (autoDownloadRef.current) {
       await downloadZipByJobId(data.jobId, resolvedZip);
@@ -734,45 +876,61 @@ export default function App() {
           <button
             type="button"
             onClick={() => setActiveView('capture')}
-            className="font-display text-lg font-bold tracking-tight text-slate-900 dark:text-slate-100 whitespace-nowrap shrink-0 cursor-pointer"
+            className="inline-flex items-center gap-2.5 font-display text-lg font-bold tracking-tight text-slate-900 dark:text-slate-100 whitespace-nowrap shrink-0 cursor-pointer"
           >
-            SiteGrab
+            <SiteGrabLogo size="sm" />
+            <span>SiteGrab</span>
           </button>
 
           {/* Zone 2: Concise single-line navigation links */}
           <nav aria-label="Primary navigation" className="flex items-center gap-6 text-sm font-medium">
+            {currentUser && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => setActiveView('capture')}
+                  className={`whitespace-nowrap shrink-0 transition-colors cursor-pointer pb-0.5 border-b-2 ${
+                    activeView === 'capture'
+                      ? 'border-sky-500 text-slate-900 dark:text-slate-100'
+                      : 'border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100'
+                  }`}
+                >
+                  Capture
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActiveView('history')}
+                  className={`whitespace-nowrap shrink-0 transition-colors cursor-pointer pb-0.5 border-b-2 ${
+                    activeView === 'history'
+                      ? 'border-sky-500 text-slate-900 dark:text-slate-100'
+                      : 'border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100'
+                  }`}
+                >
+                  History{history.length > 0 ? ` (${history.length})` : ''}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActiveView('feedback')}
+                  className={`whitespace-nowrap shrink-0 transition-colors cursor-pointer pb-0.5 border-b-2 ${
+                    activeView === 'feedback'
+                      ? 'border-sky-500 text-slate-900 dark:text-slate-100'
+                      : 'border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100'
+                  }`}
+                >
+                  Feedback
+                </button>
+              </>
+            )}
             <button
               type="button"
-              onClick={() => setActiveView('capture')}
+              onClick={() => setActiveView('guide')}
               className={`whitespace-nowrap shrink-0 transition-colors cursor-pointer pb-0.5 border-b-2 ${
-                activeView === 'capture'
+                activeView === 'guide'
                   ? 'border-sky-500 text-slate-900 dark:text-slate-100'
                   : 'border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100'
               }`}
             >
-              Capture
-            </button>
-            <button
-              type="button"
-              onClick={() => setActiveView('history')}
-              className={`whitespace-nowrap shrink-0 transition-colors cursor-pointer pb-0.5 border-b-2 ${
-                activeView === 'history'
-                  ? 'border-sky-500 text-slate-900 dark:text-slate-100'
-                  : 'border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100'
-              }`}
-            >
-              History{history.length > 0 ? ` (${history.length})` : ''}
-            </button>
-            <button
-              type="button"
-              onClick={() => setActiveView('feedback')}
-              className={`whitespace-nowrap shrink-0 transition-colors cursor-pointer pb-0.5 border-b-2 ${
-                activeView === 'feedback'
-                  ? 'border-sky-500 text-slate-900 dark:text-slate-100'
-                  : 'border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100'
-              }`}
-            >
-              Feedback
+              How to Use
             </button>
             <button
               type="button"
@@ -787,8 +945,43 @@ export default function App() {
             </button>
           </nav>
 
-          {/* Zone 3: Single primary action (Theme Switch) */}
-          <div className="shrink-0">
+          {/* Zone 3: Account Controls & Theme Switch */}
+          <div className="flex items-center gap-2 shrink-0">
+            {currentUser && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => setShowAccountModal(true)}
+                  aria-label="Open account settings"
+                  className="inline-flex items-center gap-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] hover:bg-slate-100 dark:hover:bg-slate-800 px-2.5 py-1.5 text-xs text-slate-700 dark:text-slate-200 transition-colors cursor-pointer"
+                >
+                  {currentUser.photoURL ? (
+                    <img
+                      src={currentUser.photoURL}
+                      alt={currentUser.displayName || 'Account avatar'}
+                      referrerPolicy="no-referrer"
+                      className="h-4 w-4 rounded-full object-cover"
+                    />
+                  ) : (
+                    <span className="flex h-4 w-4 items-center justify-center rounded-full bg-sky-600 text-[10px] font-bold text-white">
+                      {(currentUser.displayName || currentUser.email || 'U')[0].toUpperCase()}
+                    </span>
+                  )}
+                  <span className="hidden sm:inline max-w-[120px] truncate font-medium">
+                    {currentUser.displayName || currentUser.email?.split('@')[0]}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleSignOut()}
+                  aria-label="Sign out"
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] px-2.5 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <LogOut className="h-3.5 w-3.5" />
+                  <span className="hidden sm:inline">Sign out</span>
+                </button>
+              </>
+            )}
             <button
               type="button"
               onClick={() => setDarkMode((prev) => !prev)}
@@ -804,23 +997,51 @@ export default function App() {
 
       {/* Main Content */}
       <main className="flex-1 px-4 sm:px-6 py-10 sm:py-12">
-        {activeView === 'history' && (
-          <HistoryView
-            history={history}
-            onRecapture={handleLoadFromHistory}
-            onDownloadHistoryEntry={(entry) => void handleDownloadFromHistory(entry)}
-            onClearHistory={() => setHistory([])}
-            onSwitchToCapture={() => setActiveView('capture')}
-          />
-        )}
+        {!authReady ? (
+          <div className="flex min-h-[45vh] items-center justify-center">
+            <Loader2 className="h-6 w-6 animate-spin text-sky-500" />
+          </div>
+        ) : !currentUser ? (
+          activeView === 'terms' ? (
+            <TermsView onBackToCapture={() => setActiveView('capture')} />
+          ) : activeView === 'guide' ? (
+            <GuideView isSignedIn={false} onBackToMain={() => setActiveView('capture')} />
+          ) : (
+            <AuthGate
+              onReadTerms={() => setActiveView('terms')}
+              pendingVerificationUser={pendingVerificationUser}
+              onVerificationComplete={handleVerificationComplete}
+            />
+          )
+        ) : (
+          <>
+            {activeView === 'history' && (
+              <HistoryView
+                history={history}
+                onRecapture={handleLoadFromHistory}
+                onDownloadHistoryEntry={(entry) => void handleDownloadFromHistory(entry)}
+                onClearHistory={() => {
+                  if (currentUser) {
+                    void clearUserSnapshots(currentUser.uid).catch((err) => {
+                      console.error('Failed to clear history:', err);
+                    });
+                  }
+                }}
+                onSwitchToCapture={() => setActiveView('capture')}
+              />
+            )}
 
-        {activeView === 'feedback' && <FeedbackView />}
+            {activeView === 'feedback' && <FeedbackView />}
 
-        {activeView === 'terms' && (
-          <TermsView onBackToCapture={() => setActiveView('capture')} />
-        )}
+            {activeView === 'guide' && (
+              <GuideView isSignedIn={true} onBackToMain={() => setActiveView('capture')} />
+            )}
 
-        {activeView === 'capture' && (
+            {activeView === 'terms' && (
+              <TermsView onBackToCapture={() => setActiveView('capture')} />
+            )}
+
+            {activeView === 'capture' && (
           <div className="mx-auto max-w-5xl space-y-6">
             {chromiumMissing && (
               <section
@@ -869,8 +1090,12 @@ export default function App() {
                     disabled={isCapturing}
                     className="h-12 inline-flex items-center justify-center gap-2 rounded-xl bg-sky-600 hover:bg-sky-500 disabled:bg-sky-600/60 px-6 text-sm font-semibold text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:cursor-wait focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-500"
                   >
-                    <Download className="h-4 w-4 shrink-0" />
-                    <span>{isCapturing ? 'Capturing...' : 'Download'}</span>
+                    {isCapturing ? (
+                      <Loader2 className="h-4 w-4 animate-spin shrink-0" />
+                    ) : (
+                      <Globe className="h-4 w-4 shrink-0" />
+                    )}
+                    <span>{isCapturing ? 'Building Files...' : 'Capture Site'}</span>
                   </button>
                 </div>
 
@@ -1195,7 +1420,7 @@ export default function App() {
                       Auto-Download
                     </div>
                     <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-                      Save ZIP when ready.
+                      Off by default; click Download ZIP.
                     </p>
                   </div>
                   <input
@@ -1277,6 +1502,63 @@ export default function App() {
               </div>
             </section>
 
+            {/* Quick Start 4-Step Guide */}
+            <section
+              aria-label="Quick start guide"
+              className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-5 sm:p-6 space-y-4"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-sm font-semibold text-slate-900 dark:text-slate-100">
+                  <BookOpen className="h-4 w-4 text-sky-500" />
+                  <span>Quick Guide: How to Use SiteGrab</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveView('guide');
+                    window.scrollTo({ top: 0, behavior: 'smooth' });
+                  }}
+                  className="text-xs font-medium text-sky-600 dark:text-sky-400 hover:underline cursor-pointer"
+                >
+                  Open full step-by-step guide →
+                </button>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+                <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-[#0B0F17]/60 p-3.5 space-y-1">
+                  <div className="font-mono text-[11px] font-semibold text-sky-600 dark:text-sky-400">
+                    1. INPUT SOURCE
+                  </div>
+                  <p className="text-slate-600 dark:text-slate-400 leading-relaxed">
+                    Paste a website URL, upload a screenshot, or import an exported builder ZIP.
+                  </p>
+                </div>
+                <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-[#0B0F17]/60 p-3.5 space-y-1">
+                  <div className="font-mono text-[11px] font-semibold text-sky-600 dark:text-sky-400">
+                    2. BUILD FILES
+                  </div>
+                  <p className="text-slate-600 dark:text-slate-400 leading-relaxed">
+                    SiteGrab captures pages &amp; assets (or builds a clean fallback clone) into a structured folder.
+                  </p>
+                </div>
+                <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-[#0B0F17]/60 p-3.5 space-y-1">
+                  <div className="font-mono text-[11px] font-semibold text-sky-600 dark:text-sky-400">
+                    3. PREVIEW &amp; AI EDIT
+                  </div>
+                  <p className="text-slate-600 dark:text-slate-400 leading-relaxed">
+                    Test Desktop/Tablet/Mobile viewports, inspect source files, and refine code with the AI Assistant.
+                  </p>
+                </div>
+                <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-[#0B0F17]/60 p-3.5 space-y-1">
+                  <div className="font-mono text-[11px] font-semibold text-sky-600 dark:text-sky-400">
+                    4. DOWNLOAD &amp; RUN
+                  </div>
+                  <p className="text-slate-600 dark:text-slate-400 leading-relaxed">
+                    Click <strong>Download ZIP</strong> when ready, extract, and open in VS Code or run <code className="font-mono">npx serve .</code>.
+                  </p>
+                </div>
+              </div>
+            </section>
+
             {/* Compact Recent Downloads Strip */}
             {history.length > 0 && (
               <section className="pt-2">
@@ -1343,6 +1625,8 @@ export default function App() {
             )}
           </div>
         )}
+          </>
+        )}
       </main>
 
       {/* Structured Developer Footer */}
@@ -1351,8 +1635,9 @@ export default function App() {
           <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-start">
             {/* Column 1: Brand & Scope */}
             <div className="md:col-span-5 space-y-2">
-              <div className="font-display text-base font-bold tracking-tight text-slate-900 dark:text-slate-100">
-                SiteGrab
+              <div className="inline-flex items-center gap-2.5 font-display text-base font-bold tracking-tight text-slate-900 dark:text-slate-100">
+                <SiteGrabLogo size="sm" />
+                <span>SiteGrab</span>
               </div>
               <p className="text-xs text-slate-600 dark:text-slate-400 leading-relaxed max-w-md">
                 Website capture and offline development studio powered by headless Chromium. Export VS Code-ready archives, inspect diagnostics, and refine frontend code with AI.
@@ -1411,6 +1696,16 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => {
+                    setActiveView('guide');
+                    window.scrollTo({ top: 0, behavior: 'smooth' });
+                  }}
+                  className="hover:text-slate-900 dark:hover:text-slate-200 transition-colors cursor-pointer"
+                >
+                  How to Use
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
                     setActiveView('history');
                     window.scrollTo({ top: 0, behavior: 'smooth' });
                   }}
@@ -1450,6 +1745,15 @@ export default function App() {
           </div>
         </div>
       </footer>
+      {currentUser && showAccountModal && (
+        <AccountModal
+          user={currentUser}
+          snapshotsCount={history.length}
+          onClose={() => setShowAccountModal(false)}
+          onProfileUpdated={() => setProfileVersion((v) => v + 1)}
+          onSignOut={() => void handleSignOut()}
+        />
+      )}
     </div>
   );
 }

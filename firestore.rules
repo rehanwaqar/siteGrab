@@ -1,0 +1,213 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 1 / Global Safety Net: Deny all access by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Shared security primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isNonNegNumber(val) {
+      return (val is int || val is float) && val >= 0;
+    }
+
+    // Validation blueprint: UserProfile (no PII stored; owner-only isolation)
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'displayName', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'displayName', 'photoURL', 'createdAt', 'updatedAt']) &&
+        isValidId(data.uid) &&
+        data.uid == request.auth.uid &&
+        data.uid == userId &&
+        data.displayName is string &&
+        data.displayName.size() >= 1 &&
+        data.displayName.size() <= 120 &&
+        (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 1024)) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // Validation blueprint: UserSnapshot
+    function isValidUserSnapshot(data, userId, snapshotId) {
+      return data.keys().hasAll([
+          'id',
+          'ownerUid',
+          'url',
+          'hostname',
+          'siteTitle',
+          'zipFilename',
+          'capturedAt',
+          'pagesCaptured',
+          'assetsCaptured',
+          'htmlCount',
+          'cssCount',
+          'jsCount',
+          'imagesCount',
+          'fontsCount',
+          'otherAssetsCount',
+          'totalBytes',
+          'zipBytes',
+          'sourceMapsRecovered',
+          'skippedRobots',
+          'failedAssetsCount',
+          'screenshotsCount',
+          'durationMs',
+          'crawlDepth',
+          'maxPages',
+          'formatCode',
+          'recoverSourceMaps',
+          'includeImages',
+          'includeFonts',
+          'mobileViewport',
+          'saveScreenshots',
+          'preserveInternalNav',
+          'createdAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id',
+          'ownerUid',
+          'url',
+          'hostname',
+          'siteTitle',
+          'zipFilename',
+          'capturedAt',
+          'pagesCaptured',
+          'assetsCaptured',
+          'htmlCount',
+          'cssCount',
+          'jsCount',
+          'imagesCount',
+          'fontsCount',
+          'otherAssetsCount',
+          'totalBytes',
+          'zipBytes',
+          'sourceMapsRecovered',
+          'skippedRobots',
+          'failedAssetsCount',
+          'screenshotsCount',
+          'durationMs',
+          'crawlDepth',
+          'maxPages',
+          'formatCode',
+          'recoverSourceMaps',
+          'includeImages',
+          'includeFonts',
+          'mobileViewport',
+          'saveScreenshots',
+          'preserveInternalNav',
+          'createdAt'
+        ]) &&
+        isValidId(data.id) &&
+        data.id == snapshotId &&
+        isValidId(data.ownerUid) &&
+        data.ownerUid == request.auth.uid &&
+        data.ownerUid == userId &&
+        data.url is string && data.url.size() >= 1 && data.url.size() <= 2048 &&
+        data.hostname is string && data.hostname.size() >= 1 && data.hostname.size() <= 255 &&
+        data.siteTitle is string && data.siteTitle.size() >= 1 && data.siteTitle.size() <= 300 &&
+        data.zipFilename is string && data.zipFilename.size() >= 1 && data.zipFilename.size() <= 255 &&
+        isNonNegNumber(data.capturedAt) &&
+        isNonNegNumber(data.pagesCaptured) &&
+        isNonNegNumber(data.assetsCaptured) &&
+        isNonNegNumber(data.htmlCount) &&
+        isNonNegNumber(data.cssCount) &&
+        isNonNegNumber(data.jsCount) &&
+        isNonNegNumber(data.imagesCount) &&
+        isNonNegNumber(data.fontsCount) &&
+        isNonNegNumber(data.otherAssetsCount) &&
+        isNonNegNumber(data.totalBytes) &&
+        isNonNegNumber(data.zipBytes) &&
+        isNonNegNumber(data.sourceMapsRecovered) &&
+        isNonNegNumber(data.skippedRobots) &&
+        isNonNegNumber(data.failedAssetsCount) &&
+        isNonNegNumber(data.screenshotsCount) &&
+        isNonNegNumber(data.durationMs) &&
+        isNonNegNumber(data.crawlDepth) &&
+        isNonNegNumber(data.maxPages) &&
+        data.formatCode is bool &&
+        data.recoverSourceMaps is bool &&
+        data.includeImages is bool &&
+        data.includeFonts is bool &&
+        data.mobileViewport is bool &&
+        data.saveScreenshots is bool &&
+        data.preserveInternalNav is bool &&
+        data.createdAt is timestamp &&
+        data.createdAt == request.time;
+    }
+
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isOwner(userId) && isVerifiedUser();
+      allow list: if false;
+
+      allow create: if isValidId(userId) &&
+        isOwner(userId) &&
+        isVerifiedUser() &&
+        isValidUserProfile(incoming(), userId) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isValidId(userId) &&
+        isOwner(userId) &&
+        isVerifiedUser() &&
+        isValidUserProfile(incoming(), userId) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'updatedAt']);
+
+      allow delete: if false;
+
+      match /snapshots/{snapshotId} {
+        allow get: if isValidId(userId) &&
+          isValidId(snapshotId) &&
+          isOwner(userId) &&
+          isVerifiedUser() &&
+          existing().ownerUid == request.auth.uid &&
+          get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+
+        allow list: if isOwner(userId) &&
+          isVerifiedUser() &&
+          resource.data.ownerUid == request.auth.uid;
+
+        allow create: if isValidId(userId) &&
+          isValidId(snapshotId) &&
+          isOwner(userId) &&
+          isVerifiedUser() &&
+          isValidUserSnapshot(incoming(), userId, snapshotId) &&
+          get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+
+        allow update: if false;
+
+        allow delete: if isValidId(userId) &&
+          isValidId(snapshotId) &&
+          isOwner(userId) &&
+          isVerifiedUser() &&
+          existing().ownerUid == request.auth.uid;
+      }
+    }
+  }
+}

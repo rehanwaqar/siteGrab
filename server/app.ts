@@ -12,6 +12,13 @@ import {
   runAiCodeAssistant,
   type AiFileEdit,
 } from './ai.ts';
+import {
+  clearPreviewCookie,
+  getPreviewSessionUid,
+  issuePreviewCookie,
+  requireAuth,
+  verifySameOriginRequest,
+} from './auth.ts';
 import { CaptureError, runCaptureJob } from './capture.ts';
 import {
   addFeedbackEntry,
@@ -159,9 +166,27 @@ export function createSiteGrabServer(): Express {
     }
   });
 
-  app.post('/api/capture', async (req: Request, res: Response) => {
-    const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
-    const limitResult = rateLimiter.check(clientIp);
+  app.post('/api/auth/preview-session', requireAuth, (req: Request, res: Response) => {
+    if (!verifySameOriginRequest(req)) {
+      res.status(403).json({ error: 'Cross-origin preview session request rejected.' });
+      return;
+    }
+    issuePreviewCookie(res, req, req.authUser!.uid);
+    res.json({ ok: true });
+  });
+
+  app.post('/api/auth/logout', (req: Request, res: Response) => {
+    if (!verifySameOriginRequest(req)) {
+      res.status(403).json({ error: 'Cross-origin logout request rejected.' });
+      return;
+    }
+    clearPreviewCookie(res, req);
+    res.json({ ok: true });
+  });
+
+  app.post('/api/capture', requireAuth, async (req: Request, res: Response) => {
+    const ownerUid = req.authUser!.uid;
+    const limitResult = rateLimiter.check(ownerUid);
     if (!limitResult.allowed) {
       res.setHeader('Retry-After', String(limitResult.retryAfterSeconds));
       res.status(429).json({
@@ -249,6 +274,7 @@ export function createSiteGrabServer(): Express {
 
     const job: CaptureJob = {
       id: jobId,
+      ownerUid,
       url: options.url,
       hostname: parsedUrl.hostname,
       siteTitle: parsedUrl.hostname,
@@ -295,6 +321,8 @@ export function createSiteGrabServer(): Express {
               files: job.files,
               diagnostics: job.diagnostics,
               hasOriginalScreenshot: job.hasOriginalScreenshot,
+              captureMode: job.captureMode,
+              fallbackReason: job.fallbackReason,
             }
           : {}),
         errorCode,
@@ -328,13 +356,14 @@ export function createSiteGrabServer(): Express {
   // Upload & extract an authorized website ZIP (Bolt, Lovable, etc.) using SiteGrab processing
   app.post(
     '/api/capture/import-zip',
+    requireAuth,
     express.raw({
       type: ['application/zip', 'application/x-zip-compressed', 'application/octet-stream'],
       limit: `${MAX_UPLOAD_ZIP_BYTES}b`,
     }),
     async (req: Request, res: Response) => {
-      const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
-      const limitResult = zipImportLimiter.check(clientIp);
+      const ownerUid = req.authUser!.uid;
+      const limitResult = zipImportLimiter.check(ownerUid);
       if (!limitResult.allowed) {
         res.setHeader('Retry-After', String(limitResult.retryAfterSeconds));
         res.status(429).json({
@@ -408,6 +437,7 @@ export function createSiteGrabServer(): Express {
 
       const job: CaptureJob = {
         id: jobId,
+        ownerUid,
         url: options.url,
         hostname: baseSlug,
         siteTitle: baseSlug,
@@ -472,13 +502,14 @@ export function createSiteGrabServer(): Express {
   // Generate a complete static website & VS Code ZIP directly from a website screenshot
   app.post(
     '/api/capture/from-screenshot',
+    requireAuth,
     express.raw({
       type: ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/octet-stream'],
       limit: `${MAX_UPLOAD_SCREENSHOT_BYTES}b`,
     }),
     async (req: Request, res: Response) => {
-      const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
-      const limitResult = screenshotLimiter.check(clientIp);
+      const ownerUid = req.authUser!.uid;
+      const limitResult = screenshotLimiter.check(ownerUid);
       if (!limitResult.allowed) {
         res.setHeader('Retry-After', String(limitResult.retryAfterSeconds));
         res.status(429).json({
@@ -556,6 +587,7 @@ export function createSiteGrabServer(): Express {
 
       const job: CaptureJob = {
         id: jobId,
+        ownerUid,
         url: options.url,
         hostname: baseSlug,
         siteTitle: baseSlug,
@@ -618,9 +650,9 @@ export function createSiteGrabServer(): Express {
     },
   );
 
-  app.get('/api/capture/:jobId/events', (req: Request, res: Response) => {
+  app.get('/api/capture/:jobId/events', requireAuth, (req: Request, res: Response) => {
     const job = jobs.get(String(req.params.jobId));
-    if (!job) {
+    if (!job || job.ownerUid !== req.authUser!.uid) {
       res.status(404).json({ error: 'Capture job not found or expired.' });
       return;
     }
@@ -648,9 +680,9 @@ export function createSiteGrabServer(): Express {
     });
   });
 
-  app.get('/api/capture/:jobId/status', (req: Request, res: Response) => {
+  app.get('/api/capture/:jobId/status', requireAuth, (req: Request, res: Response) => {
     const job = jobs.get(String(req.params.jobId));
-    if (!job) {
+    if (!job || job.ownerUid !== req.authUser!.uid) {
       res.status(404).json({ error: 'Capture job not found or expired.' });
       return;
     }
@@ -662,14 +694,16 @@ export function createSiteGrabServer(): Express {
       files: job.files,
       diagnostics: job.diagnostics,
       hasOriginalScreenshot: job.hasOriginalScreenshot,
+      captureMode: job.captureMode,
+      fallbackReason: job.fallbackReason,
       cleaned: job.cleaned,
     });
   });
 
   // Serve original rendered screenshot for Original vs. Captured comparison
-  app.get('/api/capture/:jobId/original-screenshot', async (req: Request, res: Response) => {
+  app.get('/api/capture/:jobId/original-screenshot', requireAuth, async (req: Request, res: Response) => {
     const job = jobs.get(String(req.params.jobId));
-    if (!job || job.cleaned || !job.hasOriginalScreenshot) {
+    if (!job || job.ownerUid !== req.authUser!.uid || job.cleaned || !job.hasOriginalScreenshot) {
       res.status(404).send('Original screenshot unavailable.');
       return;
     }
@@ -685,9 +719,9 @@ export function createSiteGrabServer(): Express {
   });
 
   // Read individual captured text file safely for inspection / AI context
-  app.get('/api/capture/:jobId/file', async (req: Request, res: Response) => {
+  app.get('/api/capture/:jobId/file', requireAuth, async (req: Request, res: Response) => {
     const job = jobs.get(String(req.params.jobId));
-    if (!job || job.cleaned || job.status !== 'ready') {
+    if (!job || job.ownerUid !== req.authUser!.uid || job.cleaned || job.status !== 'ready') {
       res.status(404).json({ error: 'Workspace not found or expired.' });
       return;
     }
@@ -715,9 +749,9 @@ export function createSiteGrabServer(): Express {
   });
 
   // Optional Gemini AI Code Assistant operating on real captured files
-  app.post('/api/capture/:jobId/ai', async (req: Request, res: Response) => {
+  app.post('/api/capture/:jobId/ai', requireAuth, async (req: Request, res: Response) => {
     const job = jobs.get(String(req.params.jobId));
-    if (!job || job.cleaned || job.status !== 'ready') {
+    if (!job || job.ownerUid !== req.authUser!.uid || job.cleaned || job.status !== 'ready') {
       res.status(404).json({ error: 'Capture workspace expired or not ready. Please recapture the site.' });
       return;
     }
@@ -771,9 +805,9 @@ export function createSiteGrabServer(): Express {
   });
 
   // Apply AI-suggested file modifications to the captured project and rebuild ZIP
-  app.post('/api/capture/:jobId/apply-edits', async (req: Request, res: Response) => {
+  app.post('/api/capture/:jobId/apply-edits', requireAuth, async (req: Request, res: Response) => {
     const job = jobs.get(String(req.params.jobId));
-    if (!job || job.cleaned || job.status !== 'ready') {
+    if (!job || job.ownerUid !== req.authUser!.uid || job.cleaned || job.status !== 'ready') {
       res.status(404).json({ error: 'Capture workspace expired or not ready.' });
       return;
     }
@@ -846,10 +880,15 @@ export function createSiteGrabServer(): Express {
     }
   });
 
-  // Sandboxed live preview of the captured site
+  // Sandboxed live preview of the captured site (owner-scoped via HttpOnly preview cookie or Bearer token)
   app.get('/api/capture/:jobId/preview/*', async (req: Request, res: Response) => {
+    const sessionUid = await getPreviewSessionUid(req);
+    if (!sessionUid) {
+      res.status(401).send('Sign in required to preview private workspaces.');
+      return;
+    }
     const job = jobs.get(String(req.params.jobId));
-    if (!job || job.cleaned || job.status !== 'ready') {
+    if (!job || job.ownerUid !== sessionUid || job.cleaned || job.status !== 'ready') {
       res.status(404).send('Preview unavailable or archive expired.');
       return;
     }
@@ -891,13 +930,18 @@ export function createSiteGrabServer(): Express {
     }
   });
 
-  app.get('/api/capture/:jobId/preview', (req: Request, res: Response) => {
+  app.get('/api/capture/:jobId/preview', async (req: Request, res: Response) => {
+    const sessionUid = await getPreviewSessionUid(req);
+    if (!sessionUid) {
+      res.status(401).send('Sign in required to preview private workspaces.');
+      return;
+    }
     res.redirect(302, `/api/capture/${encodeURIComponent(String(req.params.jobId))}/preview/index.html`);
   });
 
-  app.head('/api/capture/:jobId/download', async (req: Request, res: Response) => {
+  app.head('/api/capture/:jobId/download', requireAuth, async (req: Request, res: Response) => {
     const job = jobs.get(String(req.params.jobId));
-    if (!job || job.cleaned || job.status !== 'ready') {
+    if (!job || job.ownerUid !== req.authUser!.uid || job.cleaned || job.status !== 'ready') {
       res.status(404).end();
       return;
     }
@@ -913,9 +957,9 @@ export function createSiteGrabServer(): Express {
   });
 
   // Stream ZIP archive cleanly while preserving workspace for preview & AI edits during TTL
-  app.get('/api/capture/:jobId/download', async (req: Request, res: Response) => {
+  app.get('/api/capture/:jobId/download', requireAuth, async (req: Request, res: Response) => {
     const job = jobs.get(String(req.params.jobId));
-    if (!job) {
+    if (!job || job.ownerUid !== req.authUser!.uid) {
       res.status(404).json({ error: 'Archive not found or expired. Click Recapture to regenerate it.' });
       return;
     }
@@ -954,10 +998,10 @@ export function createSiteGrabServer(): Express {
   });
 
   // Explicit workspace cleanup endpoint
-  app.delete('/api/capture/:jobId', async (req: Request, res: Response) => {
+  app.delete('/api/capture/:jobId', requireAuth, async (req: Request, res: Response) => {
     const jobId = String(req.params.jobId);
     const job = jobs.get(jobId);
-    if (!job) {
+    if (!job || job.ownerUid !== req.authUser!.uid) {
       res.json({ ok: true });
       return;
     }

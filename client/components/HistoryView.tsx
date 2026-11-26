@@ -25,7 +25,7 @@ export function HistoryView({
             Project History
           </h1>
           <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
-            Stored locally in your browser. Recapture any project with its saved options or download an active archive.
+            Saved privately to your signed-in account. Only you can view, recapture, or download your snapshots.
           </p>
         </div>
 

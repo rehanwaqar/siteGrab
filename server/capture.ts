@@ -32,11 +32,13 @@ import type {
   FailedResourceEntry,
   ProgressEvent,
 } from './types.ts';
+import { generateCloneFallbackForUrl } from './cloneFallback.ts';
 import {
   createZipArchive,
   listDirectoryFiles,
   writeArchivePackageJson,
   writeArchiveReadme,
+  writeArchiveWorkspaceConfig,
 } from './zipper.ts';
 
 export const MAX_TOTAL_BYTES = 100 * 1024 * 1024; // 100 MB
@@ -200,7 +202,8 @@ function buildAssetRelPath(
       path.posix
         .basename(rawBase, ext)
         .replace(/[^a-zA-Z0-9._-]/g, '_')
-        .slice(0, 48) || 'asset';
+        .replace(/^_+|_+$/g, '')
+        .slice(0, 36) || 'asset';
   } catch {
     baseName = 'asset';
   }
@@ -209,11 +212,18 @@ function buildAssetRelPath(
     ext = defaultExtForCategory(category, contentType);
   }
 
-  const shortHash = crypto.createHash('sha1').update(urlStr).digest('hex').slice(0, 8);
-  let candidate = `assets/${category}/${baseName}-${shortHash}${ext}`;
+  const folder =
+    category === 'css'
+      ? 'css'
+      : category === 'js'
+        ? 'js'
+        : `assets/${category}`;
+
+  const shortHash = crypto.createHash('sha1').update(urlStr).digest('hex').slice(0, 6);
+  let candidate = `${folder}/${baseName}-${shortHash}${ext}`;
   let counter = 1;
   while (usedPaths.has(candidate)) {
-    candidate = `assets/${category}/${baseName}-${shortHash}-${counter}${ext}`;
+    candidate = `${folder}/${baseName}-${shortHash}-${counter}${ext}`;
     counter++;
   }
   usedPaths.add(candidate);
@@ -231,18 +241,18 @@ function buildPageRelPath(
     return 'index.html';
   }
 
-  let rel = 'page.html';
+  let rel = 'page';
   try {
     const u = new URL(urlStr);
     let cleanPath = u.pathname.replace(/^\/+|\/+$/g, '');
     if (!cleanPath) {
-      rel = 'index';
+      rel = 'home';
     } else {
       cleanPath = cleanPath
         .split('/')
         .filter((s) => s && s !== '.' && s !== '..')
         .map((s) => s.replace(/[^a-zA-Z0-9._-]/g, '_'))
-        .join('/');
+        .join('-');
       if (cleanPath.endsWith('.html') || cleanPath.endsWith('.htm')) {
         cleanPath = cleanPath.replace(/\.html?$/i, '');
       }
@@ -257,10 +267,10 @@ function buildPageRelPath(
     rel = 'page';
   }
 
-  let candidate = `${rel}.html`;
+  let candidate = `pages/${rel}.html`;
   let counter = 1;
   while (usedPaths.has(candidate)) {
-    candidate = `${rel}-${counter}.html`;
+    candidate = `pages/${rel}-${counter}.html`;
     counter++;
   }
   usedPaths.add(candidate);
@@ -1055,15 +1065,15 @@ export async function runCaptureJob(
 
     stats.durationMs = Math.max(1, Date.now() - startTime);
 
-    // 8. Generate package.json (when JS or recovered sources exist) & README.md
+    // 8. Generate VS Code workspace config, package.json & README.md
+    await writeArchiveWorkspaceConfig(job.siteDir);
+
     let hasPackageJson = false;
-    if (stats.jsCount > 0 || stats.sourceMapsRecovered > 0) {
-      hasPackageJson = await writeArchivePackageJson({
-        siteDir: job.siteDir,
-        hostname: job.hostname,
-        siteTitle: job.siteTitle,
-      });
-    }
+    hasPackageJson = await writeArchivePackageJson({
+      siteDir: job.siteDir,
+      hostname: job.hostname,
+      siteTitle: job.siteTitle,
+    });
 
     await writeArchiveReadme({
       siteDir: job.siteDir,
@@ -1073,11 +1083,13 @@ export async function runCaptureJob(
       formatted: job.options.formatCode,
       recoveredSourceMaps: job.options.recoverSourceMaps,
       hasPackageJson,
+      captureMode: 'live',
     });
 
     checkAborted();
 
     // Populate diagnostics & generated folder contents
+    job.captureMode = 'live';
     job.diagnostics = {
       brokenImages,
       failedResources,
@@ -1095,22 +1107,69 @@ export async function runCaptureJob(
     stats.zipBytes = zipBytes;
     stats.durationMs = Math.max(1, Date.now() - startTime);
 
-    emit('ready', 'Snapshot complete and ready for preview, AI inspection, or download.', 100);
+    emit('ready', 'Snapshot complete. Preview your files or click Download ZIP when ready.', 100);
   } catch (err) {
-    if (err instanceof CaptureError) {
-      throw err;
+    const captureErr =
+      err instanceof CaptureError
+        ? err
+        : err instanceof SsrfValidationError
+          ? new CaptureError(err.code, err.message)
+          : timedOut
+            ? new CaptureError(
+                'TIMEOUT',
+                `Capture timed out after ${Math.round(effectiveTimeoutMs / 1000)} seconds.`,
+              )
+            : new CaptureError(
+                'CAPTURE_FAILED',
+                err instanceof Error ? err.message : 'An unexpected error occurred during capture.',
+              );
+
+    // Close Playwright resources immediately before any fallback generation
+    if (context) {
+      await context.close().catch(() => {});
+      context = null;
     }
-    if (err instanceof SsrfValidationError) {
-      throw new CaptureError(err.code, err.message);
+    if (browser) {
+      await browser.close().catch(() => {});
+      browser = null;
     }
-    if (timedOut) {
-      const secs = Math.round(effectiveTimeoutMs / 1000);
-      throw new CaptureError('TIMEOUT', `Capture timed out after ${secs} seconds.`);
+
+    const NON_CLONABLE_CODES = new Set([
+      'INVALID_URL',
+      'INVALID_SCHEME',
+      'BLOCKED_ADDRESS',
+      'ROBOTS_DISALLOWED',
+      'PRIVATE_SITE',
+      'ABORTED',
+    ]);
+
+    if (!NON_CLONABLE_CODES.has(captureErr.code)) {
+      try {
+        emit(
+          'capturing',
+          'Direct capture hit an error — creating a clean static clone instead...',
+          68,
+          captureErr.message,
+        );
+        await generateCloneFallbackForUrl({
+          targetUrl: job.url,
+          failureReason: captureErr.message,
+          job,
+          stats,
+        });
+        emit(
+          'ready',
+          'Fallback website clone complete. Preview your files or click Download ZIP when ready.',
+          100,
+          captureErr.message,
+        );
+        return;
+      } catch {
+        // If fallback cloning also fails (e.g. missing API key), propagate original error cleanly
+      }
     }
-    throw new CaptureError(
-      'CAPTURE_FAILED',
-      err instanceof Error ? err.message : 'An unexpected error occurred during capture.',
-    );
+
+    throw captureErr;
   } finally {
     clearTimeout(jobTimer);
     if (context) {

@@ -9,6 +9,7 @@ import {
   listDirectoryFiles,
   writeArchivePackageJson,
   writeArchiveReadme,
+  writeArchiveWorkspaceConfig,
 } from './zipper.ts';
 
 export const MAX_UPLOAD_SCREENSHOT_BYTES = 10 * 1024 * 1024; // 10 MB
@@ -136,8 +137,8 @@ export async function generateWebsiteFromScreenshot(options: {
     'Requirements:',
     '1. Generate clean, semantic HTML5, modern CSS3, and vanilla JavaScript.',
     '2. Recreate the exact visual hierarchy, color palette, typography scale, spacing, header/navigation, hero, cards/grids, tables/forms, buttons, badges, and footer visible in the screenshot.',
-    '3. Split files cleanly: always provide "index.html", "assets/css/styles.css", and add "assets/js/main.js" for any interactive tabs, menus, modals, or UI controls.',
-    '4. Reference local assets strictly with relative paths ("./assets/css/styles.css", "./assets/js/main.js").',
+    '3. Split files cleanly: always provide "index.html", "css/styles.css", and add "js/main.js" for any interactive tabs, menus, modals, or UI controls.',
+    '4. Reference local assets strictly with relative paths ("./css/styles.css", "./js/main.js", "./assets/images/...").',
     '5. Do NOT use external image URLs or CDN links that might break offline. Instead, use crisp inline SVGs, CSS gradients, or local "./assets/images/*.svg" files for icons, illustrations, avatars, and product thumbnails.',
     '6. Keep all text readable and responsive across desktop, tablet, and mobile viewports.',
   ].join('\n');
@@ -184,7 +185,7 @@ export async function generateWebsiteFromScreenshot(options: {
                 properties: {
                   filePath: {
                     type: Type.STRING,
-                    description: 'Relative path inside project (e.g. index.html, assets/css/styles.css, assets/js/main.js).',
+                    description: 'Relative path inside project (e.g. index.html, css/styles.css, js/main.js, assets/images/hero.svg).',
                   },
                   content: {
                     type: Type.STRING,
@@ -365,7 +366,9 @@ export async function generateWebsiteFromScreenshot(options: {
     stats.cssCount + stats.jsCount + stats.imagesCount + stats.fontsCount + stats.otherAssetsCount;
   stats.durationMs = Math.max(1, Date.now() - startTime);
 
-  if (!hasPackageJson && stats.jsCount > 0) {
+  await writeArchiveWorkspaceConfig(job.siteDir);
+
+  if (!hasPackageJson) {
     hasPackageJson = await writeArchivePackageJson({
       siteDir: job.siteDir,
       hostname: job.hostname,
@@ -382,9 +385,11 @@ export async function generateWebsiteFromScreenshot(options: {
       formatted: job.options.formatCode,
       recoveredSourceMaps: false,
       hasPackageJson,
+      captureMode: 'screenshot',
     });
   }
 
+  job.captureMode = 'screenshot';
   job.diagnostics = {
     brokenImages: [],
     failedResources: [],

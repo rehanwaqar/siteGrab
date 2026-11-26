@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   AlertCircle,
   Bot,
@@ -8,12 +8,14 @@ import {
   Eye,
   FileCode2,
   FolderTree,
+  Info,
   Loader2,
   Monitor,
   RotateCcw,
   Smartphone,
   Tablet,
 } from 'lucide-react';
+import { getAuthHeaders } from '../firebase';
 import type {
   CapturedFileEntry,
   CaptureStats,
@@ -45,7 +47,7 @@ interface PreviewPanelProps {
   }) => void;
 }
 
-const INSPECTABLE_EXTS = ['.html', '.htm', '.css', '.js', '.mjs', '.json', '.md'];
+const INSPECTABLE_EXTS = ['.html', '.htm', '.css', '.js', '.mjs', '.json', '.md', '.svg', '.txt'];
 
 export function PreviewPanel({
   jobId,
@@ -68,6 +70,7 @@ export function PreviewPanel({
   const [viewportMode, setViewportMode] = useState<'desktop' | 'tablet' | 'mobile'>('desktop');
   const [compareMode, setCompareMode] = useState<boolean>(false);
   const [previewRevision, setPreviewRevision] = useState<number>(0);
+  const [originalScreenshotBlobUrl, setOriginalScreenshotBlobUrl] = useState<string | null>(null);
 
   const [inspectedFile, setInspectedFile] = useState<{
     path: string;
@@ -77,8 +80,41 @@ export function PreviewPanel({
   } | null>(null);
 
   const previewUrl = `/api/capture/${encodeURIComponent(jobId)}/preview/index.html?rev=${previewRevision}`;
-  const originalScreenshotUrl = `/api/capture/${encodeURIComponent(jobId)}/original-screenshot`;
   const rootFolder = zipFilename.replace(/\.zip$/i, '') || `sitegrab-${hostname}`;
+
+  useEffect(() => {
+    if (!hasOriginalScreenshot) {
+      setOriginalScreenshotBlobUrl(null);
+      return;
+    }
+
+    let cancelled = false;
+    let createdUrl: string | null = null;
+
+    void (async () => {
+      try {
+        const authHeaders = await getAuthHeaders();
+        const res = await fetch(
+          `/api/capture/${encodeURIComponent(jobId)}/original-screenshot`,
+          { headers: authHeaders, cache: 'no-store' },
+        );
+        if (!res.ok || cancelled) return;
+        const blob = await res.blob();
+        if (cancelled) return;
+        createdUrl = URL.createObjectURL(blob);
+        setOriginalScreenshotBlobUrl(createdUrl);
+      } catch {
+        // Ignore non-fatal screenshot load failure
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (createdUrl) {
+        URL.revokeObjectURL(createdUrl);
+      }
+    };
+  }, [jobId, hasOriginalScreenshot]);
 
   const totalDiagnosticsIssues =
     diagnostics.brokenImages.length +
@@ -86,7 +122,8 @@ export function PreviewPanel({
     diagnostics.unresolvedLinks.length;
 
   const handleInspectFile = async (relPath: string) => {
-    if (!INSPECTABLE_EXTS.some((ext) => relPath.toLowerCase().endsWith(ext))) {
+    const lower = relPath.toLowerCase();
+    if (!INSPECTABLE_EXTS.some((ext) => lower.endsWith(ext)) && !lower.endsWith('.gitignore')) {
       setInspectedFile({
         path: relPath,
         content: '',
@@ -98,8 +135,10 @@ export function PreviewPanel({
 
     setInspectedFile({ path: relPath, content: '', loading: true });
     try {
+      const authHeaders = await getAuthHeaders();
       const res = await fetch(
         `/api/capture/${encodeURIComponent(jobId)}/file?path=${encodeURIComponent(relPath)}`,
+        { headers: authHeaders },
       );
       const data = (await res.json()) as { content?: string; error?: string };
       if (!res.ok || typeof data.content !== 'string') {
@@ -250,6 +289,16 @@ export function PreviewPanel({
         </div>
       </div>
 
+      {event.captureMode === 'clone' && (
+        <div className="border-b border-sky-200 dark:border-sky-900/60 bg-sky-50 dark:bg-sky-950/30 px-6 py-2.5 text-xs text-sky-800 dark:text-sky-200 flex items-start gap-2">
+          <Info className="h-4 w-4 shrink-0 mt-0.5 text-sky-600 dark:text-sky-400" />
+          <span>
+            <strong>Fallback Clone Generated:</strong> Direct browser capture encountered an error
+            {event.fallbackReason ? ` (${event.fallbackReason})` : ''}, so SiteGrab automatically created a clean, structured static clone project. Preview the files below and click <strong>Download ZIP</strong> when ready.
+          </span>
+        </div>
+      )}
+
       {downloadError && (
         <div className="border-b border-red-200 dark:border-red-900/60 bg-red-50 dark:bg-red-950/40 px-6 py-2.5 text-xs text-red-700 dark:text-red-300">
           {downloadError}
@@ -328,11 +377,15 @@ export function PreviewPanel({
                   Original Live Render (Chromium Screenshot)
                 </div>
                 <div className="flex-1 bg-slate-950 flex items-start justify-center overflow-auto max-h-[480px]">
-                  <img
-                    src={originalScreenshotUrl}
-                    alt={`Original live render of ${hostname}`}
-                    className="w-full h-auto object-contain"
-                  />
+                  {originalScreenshotBlobUrl ? (
+                    <img
+                      src={originalScreenshotBlobUrl}
+                      alt={`Original live render of ${hostname}`}
+                      className="w-full h-auto object-contain"
+                    />
+                  ) : (
+                    <div className="py-20 text-xs text-slate-400">Loading comparison image...</div>
+                  )}
                 </div>
               </div>
 

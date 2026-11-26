@@ -63,6 +63,8 @@ export interface CaptureStats {
   durationMs: number;
 }
 
+export type CaptureMode = 'live' | 'clone' | 'zip' | 'screenshot';
+
 export interface ProgressEvent {
   jobId: string;
   stage: CaptureStage;
@@ -73,6 +75,8 @@ export interface ProgressEvent {
   files?: CapturedFileEntry[];
   diagnostics?: DiagnosticReport;
   hasOriginalScreenshot?: boolean;
+  captureMode?: CaptureMode;
+  fallbackReason?: string;
   errorCode?: string;
 }
 
@@ -121,5 +125,5 @@ export interface FeedbackSummary {
   totalCount: number;
 }
 
-export type ActiveView = 'capture' | 'history' | 'feedback' | 'terms';
+export type ActiveView = 'capture' | 'history' | 'feedback' | 'guide' | 'terms';
 

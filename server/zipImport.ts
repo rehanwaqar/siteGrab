@@ -10,6 +10,7 @@ import {
   listDirectoryFiles,
   writeArchivePackageJson,
   writeArchiveReadme,
+  writeArchiveWorkspaceConfig,
 } from './zipper.ts';
 
 export const MAX_UPLOAD_ZIP_BYTES = 50 * 1024 * 1024; // 50 MB compressed upload
@@ -302,7 +303,9 @@ export async function processImportedZip(options: {
 
   stats.durationMs = Math.max(1, Date.now() - startTime);
 
-  if (!hasPackageJson && stats.jsCount > 0) {
+  await writeArchiveWorkspaceConfig(job.siteDir);
+
+  if (!hasPackageJson) {
     hasPackageJson = await writeArchivePackageJson({
       siteDir: job.siteDir,
       hostname: job.hostname,
@@ -319,9 +322,11 @@ export async function processImportedZip(options: {
       formatted: job.options.formatCode,
       recoveredSourceMaps: false,
       hasPackageJson,
+      captureMode: 'zip',
     });
   }
 
+  job.captureMode = 'zip';
   job.diagnostics = {
     brokenImages: [],
     failedResources: [],

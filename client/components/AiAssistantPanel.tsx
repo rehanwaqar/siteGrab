@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from 'react';
 import { Check, Code2, Loader2, Send, Wrench } from 'lucide-react';
+import { getAuthHeaders } from '../firebase';
 import type {
   AiAssistantResult,
   AiFileEdit,
@@ -83,9 +84,10 @@ export function AiAssistantPanel({ jobId, files, onEditsApplied }: AiAssistantPa
     setIsLoading(true);
 
     try {
+      const authHeaders = await getAuthHeaders();
       const res = await fetch(`/api/capture/${encodeURIComponent(jobId)}/ai`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders },
         body: JSON.stringify({
           prompt: trimmed,
           mode: activeMode,
@@ -124,9 +126,10 @@ export function AiAssistantPanel({ jobId, files, onEditsApplied }: AiAssistantPa
     setIsApplyingId(turnId);
     setErrorMsg(null);
     try {
+      const authHeaders = await getAuthHeaders();
       const res = await fetch(`/api/capture/${encodeURIComponent(jobId)}/apply-edits`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders },
         body: JSON.stringify({ edits }),
       });
       const data = (await res.json()) as {

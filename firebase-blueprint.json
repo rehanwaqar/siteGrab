@@ -1,0 +1,202 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated SiteGrab user workspace profile (non-PII display metadata only; owner-isolated).",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the account owner.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Public display name shown in the signed-in header.",
+          "maxLength": 120
+        },
+        "photoURL": {
+          "type": "string",
+          "description": "Optional profile avatar URL.",
+          "maxLength": 1024
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when profile was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when profile was last updated."
+        }
+      },
+      "required": ["uid", "displayName", "createdAt", "updatedAt"]
+    },
+    "UserSnapshot": {
+      "title": "UserSnapshot",
+      "description": "Private website capture / ZIP import / screenshot generation snapshot owned exclusively by a single user.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique job/snapshot identifier.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the user who created this snapshot.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "url": {
+          "type": "string",
+          "description": "Target URL or zip:// / screenshot:// source label.",
+          "maxLength": 2048
+        },
+        "hostname": {
+          "type": "string",
+          "description": "Normalized host or source slug.",
+          "maxLength": 255
+        },
+        "siteTitle": {
+          "type": "string",
+          "description": "Captured page title.",
+          "maxLength": 300
+        },
+        "zipFilename": {
+          "type": "string",
+          "description": "Generated ZIP archive filename.",
+          "maxLength": 255
+        },
+        "capturedAt": {
+          "type": "number",
+          "description": "Epoch milliseconds timestamp of capture completion."
+        },
+        "pagesCaptured": {
+          "type": "number"
+        },
+        "assetsCaptured": {
+          "type": "number"
+        },
+        "htmlCount": {
+          "type": "number"
+        },
+        "cssCount": {
+          "type": "number"
+        },
+        "jsCount": {
+          "type": "number"
+        },
+        "imagesCount": {
+          "type": "number"
+        },
+        "fontsCount": {
+          "type": "number"
+        },
+        "otherAssetsCount": {
+          "type": "number"
+        },
+        "totalBytes": {
+          "type": "number"
+        },
+        "zipBytes": {
+          "type": "number"
+        },
+        "sourceMapsRecovered": {
+          "type": "number"
+        },
+        "skippedRobots": {
+          "type": "number"
+        },
+        "failedAssetsCount": {
+          "type": "number"
+        },
+        "screenshotsCount": {
+          "type": "number"
+        },
+        "durationMs": {
+          "type": "number"
+        },
+        "crawlDepth": {
+          "type": "number"
+        },
+        "maxPages": {
+          "type": "number"
+        },
+        "formatCode": {
+          "type": "boolean"
+        },
+        "recoverSourceMaps": {
+          "type": "boolean"
+        },
+        "includeImages": {
+          "type": "boolean"
+        },
+        "includeFonts": {
+          "type": "boolean"
+        },
+        "mobileViewport": {
+          "type": "boolean"
+        },
+        "saveScreenshots": {
+          "type": "boolean"
+        },
+        "preserveInternalNav": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when snapshot record was saved."
+        }
+      },
+      "required": [
+        "id",
+        "ownerUid",
+        "url",
+        "hostname",
+        "siteTitle",
+        "zipFilename",
+        "capturedAt",
+        "pagesCaptured",
+        "assetsCaptured",
+        "htmlCount",
+        "cssCount",
+        "jsCount",
+        "imagesCount",
+        "fontsCount",
+        "otherAssetsCount",
+        "totalBytes",
+        "zipBytes",
+        "sourceMapsRecovered",
+        "skippedRobots",
+        "failedAssetsCount",
+        "screenshotsCount",
+        "durationMs",
+        "crawlDepth",
+        "maxPages",
+        "formatCode",
+        "recoverSourceMaps",
+        "includeImages",
+        "includeFonts",
+        "mobileViewport",
+        "saveScreenshots",
+        "preserveInternalNav",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Owner-only user workspace profile document."
+    },
+    "/users/{userId}/snapshots/{snapshotId}": {
+      "schema": { "$ref": "#/entities/UserSnapshot" },
+      "description": "Private user-scoped capture snapshot history entries."
+    }
+  }
+}

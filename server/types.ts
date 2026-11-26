@@ -64,6 +64,8 @@ export interface CaptureStats {
   durationMs: number;
 }
 
+export type CaptureMode = 'live' | 'clone' | 'zip' | 'screenshot';
+
 export interface ProgressEvent {
   jobId: string;
   stage: CaptureStage;
@@ -74,13 +76,15 @@ export interface ProgressEvent {
   files?: CapturedFileEntry[];
   diagnostics?: DiagnosticReport;
   hasOriginalScreenshot?: boolean;
+  captureMode?: CaptureMode;
+  fallbackReason?: string;
   errorCode?: string;
 }
 
 export interface CapturedAsset {
   originalUrl: string;
   normalizedUrl: string;
-  localRelPath: string; // relative to site root, e.g. assets/css/style-1a2b3c.css
+  localRelPath: string; // relative to site root, e.g. css/style-1a2b3c.css
   category: 'html' | 'css' | 'js' | 'images' | 'fonts' | 'data' | 'media';
   contentType: string;
   buffer: Buffer;
@@ -88,6 +92,7 @@ export interface CapturedAsset {
 
 export interface CaptureJob {
   id: string;
+  ownerUid: string;
   url: string;
   hostname: string;
   siteTitle: string;
@@ -100,6 +105,8 @@ export interface CaptureJob {
   zipFilename: string;
   originalScreenshotPath: string;
   hasOriginalScreenshot: boolean;
+  captureMode?: CaptureMode;
+  fallbackReason?: string;
   files: CapturedFileEntry[];
   diagnostics: DiagnosticReport;
   createdAt: number;
