@@ -187,6 +187,50 @@
         "preserveInternalNav",
         "createdAt"
       ]
+    },
+    "SnapshotPreviewBundle": {
+      "title": "SnapshotPreviewBundle",
+      "description": "Private persisted preview source bundle (HTML, CSS, JS, SVG files) for restoring preview from project history.",
+      "type": "object",
+      "properties": {
+        "snapshotId": {
+          "type": "string",
+          "description": "Parent snapshot identifier.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the snapshot owner.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "captureMode": {
+          "type": "string",
+          "description": "How this project was created (live, clone, zip, or screenshot).",
+          "enum": ["live", "clone", "zip", "screenshot"],
+          "maxLength": 20
+        },
+        "totalBytes": {
+          "type": "number",
+          "description": "Total byte size of bundled text preview files (capped under 650000 bytes)."
+        },
+        "files": {
+          "type": "array",
+          "description": "Bounded list (1 to 40 entries) of { path, content } file objects for history preview restoration."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when preview bundle was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when preview bundle was last updated."
+        }
+      },
+      "required": ["snapshotId", "ownerUid", "captureMode", "totalBytes", "files", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -197,6 +241,10 @@
     "/users/{userId}/snapshots/{snapshotId}": {
       "schema": { "$ref": "#/entities/UserSnapshot" },
       "description": "Private user-scoped capture snapshot history entries."
+    },
+    "/users/{userId}/snapshots/{snapshotId}/bundles/{bundleId}": {
+      "schema": { "$ref": "#/entities/SnapshotPreviewBundle" },
+      "description": "Private user-scoped persisted HTML/CSS/JS/SVG preview bundle for instant history preview."
     }
   }
 }

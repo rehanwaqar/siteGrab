@@ -144,8 +144,10 @@ export function rewriteHtmlDocument(options: {
     baseEl.remove();
   }
 
-  // Remove SRI integrity attributes so formatted/rewritten local files never fail integrity checks
+  // Remove target page's meta CSP & SRI integrity attributes so rewritten local ./css, ./js, and ./assets files load cleanly offline
+  $('meta[http-equiv="Content-Security-Policy"], meta[http-equiv="content-security-policy"]').remove();
   $('script[integrity], link[integrity]').removeAttr('integrity');
+  $('img[loading="lazy"]').removeAttr('loading');
 
   const urlAttrs: Array<{ selector: string; attr: string; includePages?: boolean }> = [
     { selector: 'link[href]', attr: 'href' },
@@ -209,15 +211,28 @@ export function rewriteHtmlDocument(options: {
         ) {
           return;
         }
-        const type = includePages ? 'navigation' : 'asset';
-        const dedupeKey = `${type}:${trimmed}`;
-        if (!seenUnresolved.has(dedupeKey)) {
-          seenUnresolved.add(dedupeKey);
-          unresolvedLinks.push({ href: trimmed, page: pageLocalRelPath, type });
+          const type = includePages ? 'navigation' : 'asset';
+          const dedupeKey = `${type}:${trimmed}`;
+          if (!seenUnresolved.has(dedupeKey)) {
+            seenUnresolved.add(dedupeKey);
+            unresolvedLinks.push({ href: trimmed, page: pageLocalRelPath, type });
+          }
+          // Prevent clicking uncaptured same-origin links from throwing raw 404 inside offline preview
+          if (includePages) {
+            try {
+              const targetUrl = new URL(trimmed, effectiveBase);
+              const baseUrlObj = new URL(effectiveBase);
+              if (targetUrl.origin === baseUrlObj.origin) {
+                $(el).attr('data-sitegrab-uncaptured', targetUrl.toString());
+                $(el).attr('href', `#uncaptured-${encodeURIComponent(targetUrl.pathname)}`);
+              }
+            } catch {
+              // Keep non-URL hrefs untouched
+            }
+          }
         }
-      }
-    });
-  }
+      });
+    }
 
   // Rewrite srcset attributes
   $('[srcset]').each((_, el) => {
@@ -251,6 +266,23 @@ export function rewriteHtmlDocument(options: {
     if (!css) return;
     $(el).html(rewriteCssUrls(css, effectiveBase, pageLocalRelPath, assetPathMap));
   });
+
+  // Preserve pre-rendered SPA DOM if client hydration fails or blanks out in offline/sandboxed mode
+  const hasHydratedSpaRoot =
+    $('#root, #__next, #app, #__nuxt').filter((_, el) => ($(el).text() || '').trim().length > 80)
+      .length > 0;
+  if (hasHydratedSpaRoot && $('script[data-sitegrab-spa-guard]').length === 0) {
+    $('body').append(
+      `<script data-sitegrab-spa-guard>(function(){var ids=['root','__next','app','__nuxt'];var snap={};for(var i=0;i<ids.length;i++){var el=document.getElementById(ids[i]);if(el&&el.innerHTML&&el.innerHTML.trim().length>120){snap[ids[i]]=el.innerHTML;}}if(Object.keys(snap).length===0)return;var restore=function(){for(var id in snap){var cur=document.getElementById(id);if(!cur)continue;var txt=(cur.innerText||'').trim();if(cur.innerHTML.trim().length<40||/^(404|application error|this page could not be found)/i.test(txt)){cur.innerHTML=snap[id];}}};setTimeout(restore,500);setTimeout(restore,1400);})();</script>`,
+    );
+  }
+
+  // Graceful offline feedback for uncaptured links & forms without leaving broken 404 screens
+  if ($('script[data-sitegrab-offline-ui]').length === 0) {
+    $('body').append(
+      `<script data-sitegrab-offline-ui>(function(){var showToast=function(msg){var id='sitegrab-offline-toast';var old=document.getElementById(id);if(old)old.remove();var el=document.createElement('div');el.id=id;el.style.cssText='position:fixed;bottom:16px;right:16px;z-index:2147483647;background:#0f172a;color:#f8fafc;border:1px solid #334155;border-radius:10px;padding:10px 14px;font:12px/1.4 system-ui,sans-serif;box-shadow:0 10px 25px rgba(0,0,0,0.35);max-width:340px;';el.textContent=msg;document.body.appendChild(el);setTimeout(function(){if(el.parentNode)el.remove();},3500);};document.addEventListener('click',function(e){var a=e.target&&e.target.closest?e.target.closest('a[data-sitegrab-uncaptured]'):null;if(!a)return;e.preventDefault();var raw=a.getAttribute('data-sitegrab-uncaptured')||'';showToast('Offline preview: external page not included in single-page capture ('+raw+'). Increase Crawl Depth to capture subpages.');});document.addEventListener('submit',function(e){var form=e.target;if(!form||form.tagName!=='FORM')return;var action=(form.getAttribute('action')||'').trim();if(action&&!action.startsWith('#')){e.preventDefault();showToast('Form submission previewed locally (no live backend in static snapshot).');}});})();</script>`,
+    );
+  }
 
   return { html: $.html(), unresolvedLinks };
 }

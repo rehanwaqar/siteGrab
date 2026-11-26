@@ -1,8 +1,10 @@
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import * as cheerio from 'cheerio';
 import { formatCapturedCode } from './formatter.ts';
+import { normalizeAndRepairGeneratedFiles } from './generatedSiteRepair.ts';
+import { safeFetchWithRedirectValidation } from './ssrf.ts';
 import type { CaptureJob, CaptureStats } from './types.ts';
 import {
   createZipArchive,
@@ -11,8 +13,6 @@ import {
   writeArchiveReadme,
   writeArchiveWorkspaceConfig,
 } from './zipper.ts';
-
-const ALLOWED_CLONE_EXTS = new Set(['.html', '.htm', '.css', '.js', '.mjs', '.json', '.svg', '.md']);
 
 export class CloneFallbackError extends Error {
   public readonly code: string;
@@ -46,35 +46,6 @@ function getGeminiClient(): GoogleGenAI {
   return sharedClient;
 }
 
-function normalizeCloneFilePath(rawPath: string): string | null {
-  const cleaned = rawPath
-    .replace(/\\/g, '/')
-    .replace(/^\/+/, '')
-    .split('/')
-    .filter((seg) => seg && seg !== '.' && seg !== '..')
-    .join('/');
-  if (!cleaned) return null;
-
-  // Enforce clean top-level folder structure: index.html, pages/*, css/*, js/*, assets/images/*
-  const ext = path.posix.extname(cleaned).toLowerCase();
-  if (!ALLOWED_CLONE_EXTS.has(ext)) return null;
-
-  const base = path.posix.basename(cleaned);
-  if ((ext === '.html' || ext === '.htm') && cleaned !== 'index.html' && !cleaned.startsWith('pages/')) {
-    return `pages/${base}`;
-  }
-  if (ext === '.css' && !cleaned.startsWith('css/')) {
-    return `css/${base}`;
-  }
-  if ((ext === '.js' || ext === '.mjs') && !cleaned.startsWith('js/')) {
-    return `js/${base}`;
-  }
-  if (ext === '.svg' && !cleaned.startsWith('assets/images/')) {
-    return `assets/images/${base}`;
-  }
-  return cleaned;
-}
-
 function extractHtmlSummary(rawHtml: string): string {
   try {
     const $ = cheerio.load(rawHtml);
@@ -84,16 +55,22 @@ function extractHtmlSummary(rawHtml: string): string {
       $('meta[property="og:description"]').attr('content')?.trim() ||
       '';
     const themeColor = $('meta[name="theme-color"]').attr('content')?.trim() || '';
-    const headings = $('h1, h2, h3')
-      .slice(0, 12)
-      .map((_, el) => $(el).text().trim().replace(/\s+/g, ' '))
-      .get()
-      .filter(Boolean);
     const navLinks = $('header a, nav a')
-      .slice(0, 12)
+      .slice(0, 14)
       .map((_, el) => $(el).text().trim().replace(/\s+/g, ' '))
       .get()
       .filter(Boolean);
+    const headings = $('h1, h2, h3')
+      .slice(0, 14)
+      .map((_, el) => $(el).text().trim().replace(/\s+/g, ' '))
+      .get()
+      .filter(Boolean);
+    const paragraphs = $('main p, section p, article p')
+      .slice(0, 8)
+      .map((_, el) => $(el).text().trim().replace(/\s+/g, ' '))
+      .get()
+      .filter((t) => t.length > 20)
+      .map((t) => t.slice(0, 200));
 
     return [
       title ? `Title: ${title}` : '',
@@ -101,6 +78,7 @@ function extractHtmlSummary(rawHtml: string): string {
       themeColor ? `Theme Color: ${themeColor}` : '',
       navLinks.length > 0 ? `Navigation Links: ${navLinks.join(' | ')}` : '',
       headings.length > 0 ? `Headings: ${headings.join(' | ')}` : '',
+      paragraphs.length > 0 ? `Observed Body Copy:\n- ${paragraphs.join('\n- ')}` : '',
     ]
       .filter(Boolean)
       .join('\n');
@@ -114,31 +92,82 @@ export async function generateCloneFallbackForUrl(options: {
   failureReason: string;
   partialHtml?: string;
   partialScreenshot?: Buffer | null;
+  validatedHostCache?: Map<string, string[]>;
   job: CaptureJob;
   stats: CaptureStats;
 }): Promise<void> {
-  const { targetUrl, failureReason, partialHtml, partialScreenshot, job, stats } = options;
+  const {
+    targetUrl,
+    failureReason,
+    partialHtml,
+    partialScreenshot,
+    validatedHostCache,
+    job,
+    stats,
+  } = options;
   const startTime = Date.now();
   const ai = getGeminiClient();
 
   const parsedUrl = new URL(targetUrl);
   let htmlHints = partialHtml ? extractHtmlSummary(partialHtml) : '';
 
-  // Optional fast public search grounding when no partial HTML was captured
+  // 1. If we don't have partial HTML yet, try a fast SSRF-validated HTTP GET to extract real page structure & copy
   if (!htmlHints) {
+    try {
+      const hostCache = validatedHostCache ?? new Map<string, string[]>();
+      const { response } = await Promise.race([
+        safeFetchWithRedirectValidation(
+          targetUrl,
+          {
+            headers: {
+              'User-Agent':
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
+              Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'en-US,en;q=0.9',
+            },
+          },
+          4,
+          hostCache,
+        ),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 6500)),
+      ]);
+      const ct = (response.headers.get('content-type') || '').toLowerCase();
+      if (ct.includes('text/html')) {
+        const fetchedHtml = await response.text();
+        const extracted = extractHtmlSummary(fetchedHtml);
+        if (extracted) {
+          htmlHints = extracted;
+        }
+      }
+    } catch {
+      // Fall through to Google Search grounding
+    }
+  }
+
+  // 2. Enrich via public Google Search grounding for visual palette, sections, features & domain info
+  if (!htmlHints || htmlHints.length < 300) {
     try {
       const lookupRes = await Promise.race([
         ai.models.generateContent({
           model: 'gemini-4-hydrogen',
-          contents: `Briefly describe the public homepage structure, brand identity, primary colors, navigation items, hero headline, key sections, and footer links of the website ${targetUrl} (domain: ${parsedUrl.hostname}). Be concise and factual.`,
+          contents: [
+            `Inspect the public website ${targetUrl} (domain: ${parsedUrl.hostname}).`,
+            'Summarize in structured detail:',
+            '- Brand identity, core product/service, and primary headline/tagline',
+            '- Color palette (background, accent, surface colors) and typography style',
+            '- Top navigation links and secondary pages',
+            '- Main homepage sections, interactive features (calculators, filters, tabs, search, forms, pricing), and footer structure',
+            'Be factual and concise.',
+          ].join('\n'),
           config: {
             tools: [{ googleSearch: {} }],
           },
         }),
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), 9000)),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 15_000)),
       ]);
       if (lookupRes && lookupRes.text) {
-        htmlHints = lookupRes.text.slice(0, 3500);
+        const searchText = lookupRes.text.slice(0, 3500);
+        htmlHints = htmlHints ? `${htmlHints}\n\nPublic Site Context:\n${searchText}` : searchText;
       }
     } catch {
       // Proceed cleanly using URL/domain context
@@ -146,17 +175,18 @@ export async function generateCloneFallbackForUrl(options: {
   }
 
   const systemInstruction = [
-    'You are an expert frontend architect creating a clean, responsive, VS Code-ready static website clone of a target public URL when direct headless capture was blocked or timed out.',
-    'Project structure rules (STRICT):',
-    '1. Organize files cleanly using this exact structure:',
-    '   - "index.html" (main landing page)',
-    '   - "css/styles.css" (all styling, responsive media queries, design tokens)',
-    '   - "js/main.js" (interactive navigation, tabs, filters, modals, forms, or state)',
-    '   - Optional "pages/<slug>.html" for secondary pages linked in the navbar',
-    '   - Optional "assets/images/<name>.svg" for crisp vector illustrations, brand logos, and icons',
-    '2. Every internal link and asset reference MUST use clean local relative paths ("./css/styles.css", "./js/main.js", "./assets/images/...").',
-    '3. Do NOT include any external CDN URLs or external image links that could break offline.',
-    '4. Build a rich, polished, faithful static clone matching the target brand/site domain, visual style, sections, interactive UI, and responsive desktop/tablet/mobile layouts.',
+    'You are a senior frontend engineer creating a COMPLETE, REAL, WORKING, INTERACTIVE static website project modeling the requested public URL.',
+    'STRICT QUALITY RULES — NEVER VIOLATE THESE:',
+    '1. NEVER produce dummy, placeholder, skeleton, "coming soon", "under construction", "Static clone snapshot", or "Lorem ipsum" copy. Write rich, domain-accurate, realistic headings, copy, pricing/metrics, cards, and UI labels.',
+    '2. Build a genuinely WORKING website with real interactive functionality in "js/main.js": responsive mobile menu toggle, interactive tabs/filters/search/sorting, interactive cards or detail modals, working client-side calculator/forms with validation & live DOM feedback, smooth scrolling, and state updates.',
+    '3. Project structure (STRICT):',
+    '   - "index.html": complete main landing page linking "./css/styles.css" and "./js/main.js"',
+    '   - "css/styles.css": full modern CSS3 styling matching the brand theme (dark or light), CSS variables, flexbox/grid layouts, hover/focus states, and responsive breakpoints for desktop, tablet, and mobile',
+    '   - "js/main.js": clean vanilla JS powering every interactive element on index.html and subpages',
+    '   - "pages/<slug>.html": create 2-3 working linked subpages matching the main navbar links (each linking "../css/styles.css" and "../js/main.js" cleanly)',
+    '   - "assets/images/<name>.svg": custom SVG illustrations, icons, and brand logo referenced via "./assets/images/<name>.svg"',
+    '4. Zero external CDN URLs or external image links that could break offline.',
+    '5. Every navigation link, CTA button, form, tab, and filter MUST actually do something visible when clicked.',
   ].join('\n');
 
   const promptParts: Array<
@@ -176,30 +206,33 @@ export async function generateCloneFallbackForUrl(options: {
     text: [
       `Target Website URL: ${targetUrl}`,
       `Hostname: ${parsedUrl.hostname}`,
-      htmlHints ? `Observed Public Site Context:\n${htmlHints}` : '',
-      'Generate a complete, ready-to-run static website clone project using clean HTML5, CSS3, and vanilla JavaScript.',
+      htmlHints
+        ? `Observed Real Website Context:\n${htmlHints}`
+        : `Infer the full domain purpose, brand styling, sections, and interactive workflows for ${parsedUrl.hostname}.`,
+      'Build a full, working, multi-section interactive website (HTML5 + CSS3 + vanilla JS + SVG assets + linked subpages) ready for live preview and VS Code export.',
     ]
       .filter(Boolean)
       .join('\n\n'),
   });
 
-  const callGenerate = async (modelName: string) =>
+  const callGenerate = async (modelName: string, useMediumThinking: boolean) =>
     ai.models.generateContent({
       model: modelName,
       contents: { parts: promptParts },
       config: {
         systemInstruction,
+        ...(useMediumThinking ? { thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM } } : {}),
         responseMimeType: 'application/json',
         responseSchema: {
           type: Type.OBJECT,
           properties: {
             siteTitle: {
               type: Type.STRING,
-              description: 'Title of the cloned website.',
+              description: 'Title of the website.',
             },
             summary: {
               type: Type.STRING,
-              description: 'Brief description of the cloned project.',
+              description: 'Brief summary of the generated working website.',
             },
             files: {
               type: Type.ARRAY,
@@ -208,11 +241,12 @@ export async function generateCloneFallbackForUrl(options: {
                 properties: {
                   filePath: {
                     type: Type.STRING,
-                    description: 'Relative path such as index.html, css/styles.css, js/main.js, or assets/images/hero.svg',
+                    description:
+                      'Relative path: index.html, css/styles.css, js/main.js, pages/<name>.html, or assets/images/<name>.svg',
                   },
                   content: {
                     type: Type.STRING,
-                    description: 'Complete file content.',
+                    description: 'Complete working source code for this file.',
                   },
                 },
                 required: ['filePath', 'content'],
@@ -227,12 +261,12 @@ export async function generateCloneFallbackForUrl(options: {
   let response;
   try {
     try {
-      response = await callGenerate('gemini-4-hydrogen');
+      response = await callGenerate('gemini-4-hydrogen', true);
     } catch (primaryErr) {
       const msg = primaryErr instanceof Error ? primaryErr.message : '';
       if (msg.includes('503') || msg.includes('UNAVAILABLE')) {
         await new Promise((r) => setTimeout(r, 500));
-        response = await callGenerate('gemini-3.1-flash-lite');
+        response = await callGenerate('gemini-3.1-flash-lite', false);
       } else {
         throw primaryErr;
       }
@@ -240,13 +274,13 @@ export async function generateCloneFallbackForUrl(options: {
   } catch (err) {
     throw new CloneFallbackError(
       'CAPTURE_FAILED',
-      err instanceof Error ? err.message : 'Unable to generate fallback clone.',
+      err instanceof Error ? err.message : 'Unable to generate fallback website.',
     );
   }
 
   const rawText = (response.text ?? '').trim();
   if (!rawText) {
-    throw new CloneFallbackError('CAPTURE_FAILED', 'Fallback clone generator returned empty output.');
+    throw new CloneFallbackError('CAPTURE_FAILED', 'Website generator returned empty output.');
   }
 
   let parsed: {
@@ -257,17 +291,28 @@ export async function generateCloneFallbackForUrl(options: {
   try {
     parsed = JSON.parse(rawText);
   } catch {
-    throw new CloneFallbackError('CAPTURE_FAILED', 'Fallback clone generator returned malformed JSON.');
+    throw new CloneFallbackError('CAPTURE_FAILED', 'Website generator returned malformed JSON.');
   }
 
   if (!Array.isArray(parsed.files) || parsed.files.length === 0) {
-    throw new CloneFallbackError('CAPTURE_FAILED', 'No files were produced by the fallback clone.');
+    throw new CloneFallbackError('CAPTURE_FAILED', 'No files were produced by the website generator.');
   }
 
-  // Reset siteDir cleanly before writing clone files
+  const normalizedEntries = normalizeAndRepairGeneratedFiles(
+    parsed.files,
+    parsed.siteTitle?.trim() || parsedUrl.hostname,
+  );
+
+  // Reset siteDir cleanly before writing files
   await fsp.rm(job.siteDir, { recursive: true, force: true });
   const baseDir = path.resolve(job.siteDir);
   await fsp.mkdir(baseDir, { recursive: true });
+
+  if (partialScreenshot && partialScreenshot.length > 0) {
+    await fsp.mkdir(path.dirname(job.originalScreenshotPath), { recursive: true });
+    await fsp.writeFile(job.originalScreenshotPath, partialScreenshot);
+    job.hasOriginalScreenshot = true;
+  }
 
   stats.pagesCaptured = 0;
   stats.assetsCaptured = 0;
@@ -284,22 +329,18 @@ export async function generateCloneFallbackForUrl(options: {
   let hasReadme = false;
   let totalBytes = 0;
 
-  for (const item of parsed.files) {
-    if (!item || typeof item.filePath !== 'string' || typeof item.content !== 'string') continue;
-    const cleanRel = normalizeCloneFilePath(item.filePath);
-    if (!cleanRel) continue;
-
-    const ext = path.posix.extname(cleanRel).toLowerCase();
-    const destPath = path.resolve(baseDir, cleanRel);
+  for (const entry of normalizedEntries) {
+    const destPath = path.resolve(baseDir, entry.cleanRel);
     if (!destPath.startsWith(baseDir + path.sep)) continue;
 
-    let finalContent = item.content;
+    let finalContent = entry.content;
+
     if (job.options.formatCode) {
-      if (ext === '.html' || ext === '.htm') {
+      if (entry.ext === '.html' || entry.ext === '.htm') {
         finalContent = await formatCapturedCode(finalContent, 'html');
-      } else if (ext === '.css') {
+      } else if (entry.ext === '.css') {
         finalContent = await formatCapturedCode(finalContent, 'css');
-      } else if (ext === '.js' || ext === '.mjs') {
+      } else if (entry.ext === '.js' || entry.ext === '.mjs') {
         finalContent = await formatCapturedCode(finalContent, 'js');
       }
     }
@@ -308,37 +349,22 @@ export async function generateCloneFallbackForUrl(options: {
     await fsp.writeFile(destPath, finalContent, 'utf8');
     totalBytes += Buffer.byteLength(finalContent, 'utf8');
 
-    if (cleanRel === 'index.html') hasIndexHtml = true;
-    if (cleanRel === 'package.json') hasPackageJson = true;
-    if (cleanRel.toLowerCase() === 'readme.md') hasReadme = true;
+    if (entry.cleanRel === 'index.html') hasIndexHtml = true;
+    if (entry.cleanRel === 'package.json') hasPackageJson = true;
+    if (entry.cleanRel.toLowerCase() === 'readme.md') hasReadme = true;
 
-    if (ext === '.html' || ext === '.htm') stats.htmlCount += 1;
-    else if (ext === '.css') stats.cssCount += 1;
-    else if (ext === '.js' || ext === '.mjs') stats.jsCount += 1;
-    else if (ext === '.svg') stats.imagesCount += 1;
+    if (entry.ext === '.html' || entry.ext === '.htm') stats.htmlCount += 1;
+    else if (entry.ext === '.css') stats.cssCount += 1;
+    else if (entry.ext === '.js' || entry.ext === '.mjs') stats.jsCount += 1;
+    else if (entry.ext === '.svg') stats.imagesCount += 1;
     else stats.otherAssetsCount += 1;
   }
 
   if (!hasIndexHtml) {
-    const title = parsed.siteTitle?.trim() || parsedUrl.hostname;
-    const fallbackHtml = `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>${title}</title>
-    <link rel="stylesheet" href="./css/styles.css" />
-  </head>
-  <body>
-    <main style="font-family: system-ui, sans-serif; padding: 2rem;">
-      <h1>${title}</h1>
-      <p>${parsed.summary || `Static clone snapshot for ${targetUrl}.`}</p>
-    </main>
-    <script src="./js/main.js"></script>
-  </body>
-</html>`;
-    await fsp.writeFile(path.join(baseDir, 'index.html'), fallbackHtml, 'utf8');
-    stats.htmlCount += 1;
+    throw new CloneFallbackError(
+      'CAPTURE_FAILED',
+      'Website generator did not produce an index.html entry page.',
+    );
   }
 
   job.siteTitle = parsed.siteTitle?.trim() || parsedUrl.hostname;

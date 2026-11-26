@@ -102,6 +102,17 @@ export interface HistoryEntry {
   options: Omit<CaptureOptions, 'url'>;
 }
 
+export interface SavedPreviewBundleFile {
+  path: string;
+  content: string;
+}
+
+export interface SavedPreviewBundle {
+  captureMode: CaptureMode;
+  totalBytes: number;
+  files: SavedPreviewBundleFile[];
+}
+
 export type FeedbackCategory =
   | 'Experience'
   | 'Feature Idea'

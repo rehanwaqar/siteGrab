@@ -1,8 +1,9 @@
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import * as cheerio from 'cheerio';
 import { formatCapturedCode } from './formatter.ts';
+import { normalizeAndRepairGeneratedFiles } from './generatedSiteRepair.ts';
 import type { CaptureJob, CaptureStats } from './types.ts';
 import {
   createZipArchive,
@@ -13,8 +14,6 @@ import {
 } from './zipper.ts';
 
 export const MAX_UPLOAD_SCREENSHOT_BYTES = 10 * 1024 * 1024; // 10 MB
-
-const ALLOWED_EXTS = new Set(['.html', '.htm', '.css', '.js', '.mjs', '.json', '.svg', '.md']);
 
 export class ScreenshotGenError extends Error {
   public readonly statusCode: number;
@@ -133,11 +132,11 @@ export async function generateWebsiteFromScreenshot(options: {
   const ai = getGeminiClient();
 
   const systemInstruction = [
-    'You are an expert frontend engineer converting a website/UI screenshot into a complete, pixel-faithful, responsive static website project.',
+    'You are an expert frontend engineer converting a website/UI screenshot into a complete, pixel-faithful, responsive, WORKING interactive static website project.',
     'Requirements:',
-    '1. Generate clean, semantic HTML5, modern CSS3, and vanilla JavaScript.',
+    '1. Generate clean, semantic HTML5, modern CSS3, and real working vanilla JavaScript — NEVER leave placeholder stubs, "coming soon" sections, or dead buttons.',
     '2. Recreate the exact visual hierarchy, color palette, typography scale, spacing, header/navigation, hero, cards/grids, tables/forms, buttons, badges, and footer visible in the screenshot.',
-    '3. Split files cleanly: always provide "index.html", "css/styles.css", and add "js/main.js" for any interactive tabs, menus, modals, or UI controls.',
+    '3. Split files cleanly: always provide "index.html", "css/styles.css", and "js/main.js" powering interactive tabs, filters, search, modals, mobile menu toggles, calculators, or forms with live DOM feedback.',
     '4. Reference local assets strictly with relative paths ("./css/styles.css", "./js/main.js", "./assets/images/...").',
     '5. Do NOT use external image URLs or CDN links that might break offline. Instead, use crisp inline SVGs, CSS gradients, or local "./assets/images/*.svg" files for icons, illustrations, avatars, and product thumbnails.',
     '6. Keep all text readable and responsive across desktop, tablet, and mobile viewports.',
@@ -157,7 +156,7 @@ export async function generateWebsiteFromScreenshot(options: {
     },
   };
 
-  const callVisionGenerate = async (modelName: string) =>
+  const callVisionGenerate = async (modelName: string, useMediumThinking: boolean) =>
     ai.models.generateContent({
       model: modelName,
       contents: {
@@ -165,6 +164,7 @@ export async function generateWebsiteFromScreenshot(options: {
       },
       config: {
         systemInstruction,
+        ...(useMediumThinking ? { thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM } } : {}),
         responseMimeType: 'application/json',
         responseSchema: {
           type: Type.OBJECT,
@@ -204,12 +204,12 @@ export async function generateWebsiteFromScreenshot(options: {
   let response;
   try {
     try {
-      response = await callVisionGenerate('gemini-4-hydrogen');
+      response = await callVisionGenerate('gemini-4-hydrogen', true);
     } catch (primaryErr) {
       const msg = primaryErr instanceof Error ? primaryErr.message : '';
       if (msg.includes('503') || msg.includes('UNAVAILABLE')) {
         await new Promise((r) => setTimeout(r, 500));
-        response = await callVisionGenerate('gemini-3.1-flash-lite');
+        response = await callVisionGenerate('gemini-3.1-flash-lite', false);
       } else {
         throw primaryErr;
       }
@@ -280,34 +280,26 @@ export async function generateWebsiteFromScreenshot(options: {
 
   await fsp.mkdir(baseDir, { recursive: true });
 
-  let hasIndexHtml = false;
+  const normalizedEntries = normalizeAndRepairGeneratedFiles(
+    parsed.files,
+    parsed.siteTitle?.trim() || 'Generated Website',
+  );
+
   let hasPackageJson = false;
   let hasReadme = false;
   let totalBytes = 0;
 
-  for (const item of parsed.files) {
-    if (!item || typeof item.filePath !== 'string' || typeof item.content !== 'string') continue;
-    const cleanRel = item.filePath
-      .replace(/\\/g, '/')
-      .replace(/^\/+/, '')
-      .split('/')
-      .filter((seg) => seg && seg !== '.' && seg !== '..')
-      .join('/');
-    if (!cleanRel) continue;
-
-    const ext = path.posix.extname(cleanRel).toLowerCase();
-    if (!ALLOWED_EXTS.has(ext)) continue;
-
-    const destPath = path.resolve(baseDir, cleanRel);
+  for (const entry of normalizedEntries) {
+    const destPath = path.resolve(baseDir, entry.cleanRel);
     if (!destPath.startsWith(baseDir + path.sep)) continue;
 
-    let finalContent = item.content;
+    let finalContent = entry.content;
     if (job.options.formatCode) {
-      if (ext === '.html' || ext === '.htm') {
+      if (entry.ext === '.html' || entry.ext === '.htm') {
         finalContent = await formatCapturedCode(finalContent, 'html');
-      } else if (ext === '.css') {
+      } else if (entry.ext === '.css') {
         finalContent = await formatCapturedCode(finalContent, 'css');
-      } else if (ext === '.js' || ext === '.mjs') {
+      } else if (entry.ext === '.js' || entry.ext === '.mjs') {
         finalContent = await formatCapturedCode(finalContent, 'js');
       }
     }
@@ -316,35 +308,14 @@ export async function generateWebsiteFromScreenshot(options: {
     await fsp.writeFile(destPath, finalContent, 'utf8');
     totalBytes += Buffer.byteLength(finalContent, 'utf8');
 
-    if (cleanRel === 'index.html') hasIndexHtml = true;
-    if (cleanRel === 'package.json') hasPackageJson = true;
-    if (cleanRel.toLowerCase() === 'readme.md') hasReadme = true;
+    if (entry.cleanRel === 'package.json') hasPackageJson = true;
+    if (entry.cleanRel.toLowerCase() === 'readme.md') hasReadme = true;
 
-    if (ext === '.html' || ext === '.htm') stats.htmlCount += 1;
-    else if (ext === '.css') stats.cssCount += 1;
-    else if (ext === '.js' || ext === '.mjs') stats.jsCount += 1;
-    else if (ext === '.svg') stats.imagesCount += 1;
+    if (entry.ext === '.html' || entry.ext === '.htm') stats.htmlCount += 1;
+    else if (entry.ext === '.css') stats.cssCount += 1;
+    else if (entry.ext === '.js' || entry.ext === '.mjs') stats.jsCount += 1;
+    else if (entry.ext === '.svg') stats.imagesCount += 1;
     else stats.otherAssetsCount += 1;
-  }
-
-  if (!hasIndexHtml) {
-    // Guarantee an entry index.html exists
-    const fallbackHtml = `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>${parsed.siteTitle || 'Generated Website'}</title>
-  </head>
-  <body>
-    <main style="font-family: system-ui, sans-serif; padding: 2rem;">
-      <h1>${parsed.siteTitle || 'Generated Website'}</h1>
-      <p>${parsed.summary || 'Website generated from screenshot.'}</p>
-    </main>
-  </body>
-</html>`;
-    await fsp.writeFile(path.join(baseDir, 'index.html'), fallbackHtml, 'utf8');
-    stats.htmlCount += 1;
   }
 
   // Derive siteTitle cleanly from index.html or Gemini payload

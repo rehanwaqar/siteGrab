@@ -15,8 +15,10 @@ import {
 import {
   clearPreviewCookie,
   getPreviewSessionUid,
+  issueJobPreviewToken,
   issuePreviewCookie,
   requireAuth,
+  verifyJobPreviewToken,
   verifySameOriginRequest,
 } from './auth.ts';
 import { CaptureError, runCaptureJob } from './capture.ts';
@@ -45,8 +47,12 @@ import {
 import { MAX_UPLOAD_ZIP_BYTES, processImportedZip, ZipImportError } from './zipImport.ts';
 import { createZipArchive, listDirectoryFiles } from './zipper.ts';
 
-const JOB_TTL_MS = 15 * 60 * 1000; // 15 minutes retention for preview, AI editing, and ZIP download
+const JOB_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours retention for preview, AI editing, and ZIP download
 const CLEANUP_INTERVAL_MS = 60 * 1000;
+const BUNDLE_MAX_FILES = 40;
+const BUNDLE_MAX_BYTES = 600_000;
+const BUNDLE_MAX_SINGLE_FILE_BYTES = 450_000;
+const BUNDLE_EXTS = new Set(['.html', '.htm', '.css', '.js', '.mjs', '.svg', '.json', '.md']);
 
 const MIME_MAP: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -77,7 +83,7 @@ const MIME_MAP: Record<string, string> = {
 export function createSiteGrabServer(): Express {
   const app = express();
   app.set('trust proxy', 1);
-  app.use(express.json({ limit: '512kb' }));
+  app.use(express.json({ limit: '1mb' }));
 
   const jobs = new Map<string, CaptureJob>();
   const rateLimiter = new IpRateLimiter(5, 10 * 60 * 1000);
@@ -92,6 +98,103 @@ export function createSiteGrabServer(): Express {
       await fsp.rm(job.tempRoot, { recursive: true, force: true });
     } catch {
       // Ignore cleanup errors
+    }
+  }
+
+  async function saveJobMetaToDisk(job: CaptureJob): Promise<void> {
+    if (job.cleaned || job.status !== 'ready') return;
+    try {
+      await fsp.mkdir(job.tempRoot, { recursive: true });
+      const metaPath = path.join(job.tempRoot, '_sitegrab_meta.json');
+      const meta = {
+        id: job.id,
+        ownerUid: job.ownerUid,
+        url: job.url,
+        hostname: job.hostname,
+        siteTitle: job.siteTitle,
+        siteDir: job.siteDir,
+        zipPath: job.zipPath,
+        zipFilename: job.zipFilename,
+        captureMode: job.captureMode,
+        fallbackReason: job.fallbackReason,
+        hasOriginalScreenshot: job.hasOriginalScreenshot,
+        options: job.options,
+        stats: job.lastEvent.stats,
+        diagnostics: job.diagnostics,
+        lastEvent: job.lastEvent,
+        createdAt: job.createdAt,
+        expiresAt: job.expiresAt,
+      };
+      await fsp.writeFile(metaPath, JSON.stringify(meta), 'utf8');
+    } catch {
+      // Non-fatal metadata write failure
+    }
+  }
+
+  async function loadOrGetJob(jobId: string): Promise<CaptureJob | undefined> {
+    const existing = jobs.get(jobId);
+    if (existing) return existing;
+    if (!/^[a-zA-Z0-9_-]{4,128}$/.test(jobId)) return undefined;
+
+    const tempRoot = path.join(os.tmpdir(), `sitegrab-${jobId}`);
+    const metaPath = path.join(tempRoot, '_sitegrab_meta.json');
+    try {
+      const raw = await fsp.readFile(metaPath, 'utf8');
+      const meta = JSON.parse(raw) as Partial<CaptureJob> & {
+        stats?: CaptureStats;
+      };
+      if (!meta.ownerUid || !meta.zipFilename) {
+        return undefined;
+      }
+      const siteDir = path.join(tempRoot, 'site');
+      const zipPath = path.join(tempRoot, path.basename(meta.zipFilename));
+      const files = await listDirectoryFiles(siteDir);
+      if (files.length === 0) return undefined;
+
+      const restoredJob: CaptureJob = {
+        id: jobId,
+        ownerUid: meta.ownerUid,
+        url: meta.url || `https://${meta.hostname || 'site'}`,
+        hostname: meta.hostname || 'site',
+        siteTitle: meta.siteTitle || meta.hostname || 'Captured Site',
+        options: meta.options!,
+        status: 'ready',
+        lastEvent: meta.lastEvent || {
+          jobId,
+          stage: 'ready',
+          message: 'Workspace restored.',
+          percent: 100,
+          stats: meta.stats!,
+          files,
+          diagnostics: meta.diagnostics,
+          hasOriginalScreenshot: Boolean(meta.hasOriginalScreenshot),
+          captureMode: meta.captureMode,
+          fallbackReason: meta.fallbackReason,
+        },
+        tempRoot,
+        siteDir,
+        zipPath,
+        zipFilename: path.basename(meta.zipFilename),
+        originalScreenshotPath:
+          meta.originalScreenshotPath || path.join(tempRoot, '_original-preview.png'),
+        hasOriginalScreenshot: Boolean(meta.hasOriginalScreenshot),
+        captureMode: meta.captureMode,
+        fallbackReason: meta.fallbackReason,
+        files,
+        diagnostics: meta.diagnostics || {
+          brokenImages: [],
+          failedResources: [],
+          unresolvedLinks: [],
+        },
+        createdAt: meta.createdAt || Date.now(),
+        expiresAt: Date.now() + JOB_TTL_MS,
+        cleaned: false,
+        subscribers: new Set(),
+      };
+      jobs.set(jobId, restoredJob);
+      return restoredJob;
+    } catch {
+      return undefined;
     }
   }
 
@@ -337,6 +440,9 @@ export function createSiteGrabServer(): Express {
     void (async () => {
       try {
         await runCaptureJob(job, emit, stats);
+        if (job.status === 'ready') {
+          await saveJobMetaToDisk(job);
+        }
       } catch (err) {
         const code = err instanceof CaptureError ? err.code : 'CAPTURE_FAILED';
         const msg = err instanceof Error ? err.message : 'Capture failed.';
@@ -477,12 +583,14 @@ export function createSiteGrabServer(): Express {
           hasOriginalScreenshot: false,
         };
         jobs.set(jobId, job);
+        await saveJobMetaToDisk(job);
         res.status(201).json({
           jobId,
           url: job.url,
           hostname: job.hostname,
           siteTitle: job.siteTitle,
           zipFilename: job.zipFilename,
+          previewToken: issueJobPreviewToken(ownerUid, jobId),
           event: job.lastEvent,
         });
       } catch (err) {
@@ -628,12 +736,14 @@ export function createSiteGrabServer(): Express {
           hasOriginalScreenshot: job.hasOriginalScreenshot,
         };
         jobs.set(jobId, job);
+        await saveJobMetaToDisk(job);
         res.status(201).json({
           jobId,
           url: job.url,
           hostname: job.hostname,
           siteTitle: job.siteTitle,
           zipFilename: job.zipFilename,
+          previewToken: issueJobPreviewToken(ownerUid, jobId),
           event: job.lastEvent,
         });
       } catch (err) {
@@ -680,17 +790,19 @@ export function createSiteGrabServer(): Express {
     });
   });
 
-  app.get('/api/capture/:jobId/status', requireAuth, (req: Request, res: Response) => {
-    const job = jobs.get(String(req.params.jobId));
+  app.get('/api/capture/:jobId/status', requireAuth, async (req: Request, res: Response) => {
+    const job = await loadOrGetJob(String(req.params.jobId));
     if (!job || job.ownerUid !== req.authUser!.uid) {
       res.status(404).json({ error: 'Capture job not found or expired.' });
       return;
     }
+    job.expiresAt = Date.now() + JOB_TTL_MS;
     res.json({
       ...job.lastEvent,
       siteTitle: job.siteTitle,
       hostname: job.hostname,
       zipFilename: job.zipFilename,
+      previewToken: issueJobPreviewToken(req.authUser!.uid, job.id),
       files: job.files,
       diagnostics: job.diagnostics,
       hasOriginalScreenshot: job.hasOriginalScreenshot,
@@ -700,9 +812,276 @@ export function createSiteGrabServer(): Express {
     });
   });
 
+  // Export lightweight previewable source files so client can persist history previews in Firestore
+  app.get('/api/capture/:jobId/bundle', requireAuth, async (req: Request, res: Response) => {
+    const job = await loadOrGetJob(String(req.params.jobId));
+    if (!job || job.ownerUid !== req.authUser!.uid || job.cleaned || job.status !== 'ready') {
+      res.status(404).json({ error: 'Capture workspace unavailable.' });
+      return;
+    }
+
+    const scorePriority = (relPath: string): number => {
+      if (relPath === 'index.html') return 0;
+      if (relPath.endsWith('.css')) return 1;
+      if (relPath.endsWith('.js') || relPath.endsWith('.mjs')) return 2;
+      if (relPath.endsWith('.html') || relPath.endsWith('.htm')) return 3;
+      if (relPath.endsWith('.svg')) return 4;
+      if (relPath === 'package.json' || relPath.toLowerCase() === 'readme.md') return 5;
+      return 6;
+    };
+
+    const sortedCandidates = [...job.files]
+      .filter((f) => {
+        if (f.path.startsWith('.vscode/')) return false;
+        const ext = path.posix.extname(f.path).toLowerCase();
+        return BUNDLE_EXTS.has(ext) && f.size > 0 && f.size <= BUNDLE_MAX_SINGLE_FILE_BYTES;
+      })
+      .sort((a, b) => scorePriority(a.path) - scorePriority(b.path) || a.size - b.size);
+
+    const bundledFiles: Array<{ path: string; content: string }> = [];
+    let totalBytes = 0;
+
+    for (const candidate of sortedCandidates) {
+      if (bundledFiles.length >= BUNDLE_MAX_FILES) break;
+      try {
+        const resolved = resolveSafeSiteFile(job.siteDir, candidate.path);
+        const content = await fsp.readFile(resolved, 'utf8');
+        const byteLen = Buffer.byteLength(content, 'utf8');
+        if (byteLen > BUNDLE_MAX_SINGLE_FILE_BYTES) continue;
+        if (totalBytes + byteLen > BUNDLE_MAX_BYTES) continue;
+        bundledFiles.push({ path: candidate.path, content });
+        totalBytes += byteLen;
+      } catch {
+        // Skip unreadable entries
+      }
+    }
+
+    res.json({
+      captureMode: job.captureMode || 'live',
+      totalBytes,
+      files: bundledFiles,
+    });
+  });
+
+  // Restore a saved preview bundle from Firestore back into an active preview + ZIP workspace
+  app.post('/api/capture/restore', requireAuth, express.json({ limit: '1mb' }), async (req: Request, res: Response) => {
+    const ownerUid = req.authUser!.uid;
+    const body = (req.body ?? {}) as {
+      snapshotId?: unknown;
+      url?: unknown;
+      hostname?: unknown;
+      siteTitle?: unknown;
+      zipFilename?: unknown;
+      captureMode?: unknown;
+      stats?: Partial<CaptureStats>;
+      options?: Partial<CaptureOptions>;
+      files?: Array<{ path?: unknown; content?: unknown }>;
+    };
+
+    const rawId = typeof body.snapshotId === 'string' ? body.snapshotId.trim() : '';
+    const jobId = /^[a-zA-Z0-9_-]{4,128}$/.test(rawId) ? rawId : crypto.randomUUID();
+
+    // If workspace already exists on server for this owner, reuse it cleanly
+    const existing = await loadOrGetJob(jobId);
+    if (existing && existing.ownerUid === ownerUid && !existing.cleaned && existing.status === 'ready') {
+      existing.expiresAt = Date.now() + JOB_TTL_MS;
+      res.json({
+        jobId: existing.id,
+        previewToken: issueJobPreviewToken(ownerUid, existing.id),
+        event: existing.lastEvent,
+        siteTitle: existing.siteTitle,
+        hostname: existing.hostname,
+        zipFilename: existing.zipFilename,
+        files: existing.files,
+        diagnostics: existing.diagnostics,
+        hasOriginalScreenshot: existing.hasOriginalScreenshot,
+        captureMode: existing.captureMode,
+      });
+      return;
+    }
+
+    if (!Array.isArray(body.files) || body.files.length === 0 || body.files.length > BUNDLE_MAX_FILES) {
+      res.status(400).json({ error: 'Invalid or empty preview bundle.' });
+      return;
+    }
+
+    const hostname =
+      typeof body.hostname === 'string' && body.hostname.trim()
+        ? body.hostname.trim().slice(0, 255)
+        : 'restored-site';
+    const siteTitle =
+      typeof body.siteTitle === 'string' && body.siteTitle.trim()
+        ? body.siteTitle.trim().slice(0, 300)
+        : hostname;
+    const url =
+      typeof body.url === 'string' && body.url.trim()
+        ? body.url.trim().slice(0, 2048)
+        : `https://${hostname}`;
+    const zipFilename =
+      typeof body.zipFilename === 'string' && body.zipFilename.trim()
+        ? path.basename(body.zipFilename.trim()).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120)
+        : `sitegrab-${hostname}.zip`;
+    const captureMode =
+      body.captureMode === 'clone' ||
+      body.captureMode === 'zip' ||
+      body.captureMode === 'screenshot'
+        ? body.captureMode
+        : 'live';
+
+    const tempRoot = path.join(os.tmpdir(), `sitegrab-${jobId}`);
+    const siteDir = path.join(tempRoot, 'site');
+    const baseDir = path.resolve(siteDir);
+    const zipPath = path.join(tempRoot, zipFilename);
+
+    try {
+      await fsp.rm(tempRoot, { recursive: true, force: true });
+      await fsp.mkdir(siteDir, { recursive: true });
+
+      let writtenBytes = 0;
+      let writtenCount = 0;
+      for (const item of body.files) {
+        if (!item || typeof item.path !== 'string' || typeof item.content !== 'string') continue;
+        const cleanRel = item.path
+          .replace(/\\/g, '/')
+          .replace(/^\/+/, '')
+          .split('/')
+          .filter((seg) => seg && seg !== '.' && seg !== '..')
+          .join('/');
+        if (!cleanRel) continue;
+
+        const ext = path.posix.extname(cleanRel).toLowerCase();
+        if (!BUNDLE_EXTS.has(ext)) continue;
+
+        const destPath = path.resolve(baseDir, cleanRel);
+        if (!destPath.startsWith(baseDir + path.sep)) continue;
+
+        const bytes = Buffer.byteLength(item.content, 'utf8');
+        if (bytes > BUNDLE_MAX_SINGLE_FILE_BYTES || writtenBytes + bytes > BUNDLE_MAX_BYTES + 100_000) {
+          continue;
+        }
+        await fsp.mkdir(path.dirname(destPath), { recursive: true });
+        await fsp.writeFile(destPath, item.content, 'utf8');
+        writtenBytes += bytes;
+        writtenCount += 1;
+      }
+
+      if (writtenCount === 0) {
+        await fsp.rm(tempRoot, { recursive: true, force: true });
+        res.status(400).json({ error: 'No valid preview files found in saved history bundle.' });
+        return;
+      }
+
+      const files = await listDirectoryFiles(siteDir);
+      const rootFolderName = path.basename(zipFilename, '.zip') || `sitegrab-${hostname}`;
+      const zipBytes = await createZipArchive(siteDir, zipPath, rootFolderName);
+
+      const stats: CaptureStats = {
+        pagesCaptured: Math.max(1, Number(body.stats?.pagesCaptured ?? 1) || 1),
+        assetsCaptured: Number(body.stats?.assetsCaptured ?? Math.max(0, files.length - 1)) || 0,
+        htmlCount: Number(body.stats?.htmlCount ?? 1) || 1,
+        cssCount: Number(body.stats?.cssCount ?? 0) || 0,
+        jsCount: Number(body.stats?.jsCount ?? 0) || 0,
+        imagesCount: Number(body.stats?.imagesCount ?? 0) || 0,
+        fontsCount: Number(body.stats?.fontsCount ?? 0) || 0,
+        otherAssetsCount: Number(body.stats?.otherAssetsCount ?? 0) || 0,
+        totalBytes: files.reduce((sum, f) => sum + f.size, 0),
+        zipBytes,
+        sourceMapsRecovered: Number(body.stats?.sourceMapsRecovered ?? 0) || 0,
+        skippedRobots: Number(body.stats?.skippedRobots ?? 0) || 0,
+        failedAssetsCount: Number(body.stats?.failedAssetsCount ?? 0) || 0,
+        screenshotsCount: Number(body.stats?.screenshotsCount ?? 0) || 0,
+        durationMs: Number(body.stats?.durationMs ?? 0) || 0,
+      };
+
+      const options: CaptureOptions = {
+        url,
+        crawlDepth: Number(body.options?.crawlDepth ?? 0) || 0,
+        maxPages: Math.max(1, Number(body.options?.maxPages ?? 1) || 1),
+        formatCode: body.options?.formatCode !== false,
+        recoverSourceMaps: Boolean(body.options?.recoverSourceMaps),
+        respectRobots: true,
+        includeImages: body.options?.includeImages !== false,
+        includeFonts: body.options?.includeFonts !== false,
+        mobileViewport: Boolean(body.options?.mobileViewport),
+        saveScreenshots: Boolean(body.options?.saveScreenshots),
+        preserveInternalNav: body.options?.preserveInternalNav !== false,
+      };
+
+      const readyEvent: ProgressEvent = {
+        jobId,
+        stage: 'ready',
+        message: 'Restored saved workspace from project history.',
+        percent: 100,
+        stats,
+        files,
+        diagnostics: {
+          brokenImages: [],
+          failedResources: [],
+          unresolvedLinks: [],
+        },
+        hasOriginalScreenshot: false,
+        captureMode,
+      };
+
+      const restoredJob: CaptureJob = {
+        id: jobId,
+        ownerUid,
+        url,
+        hostname,
+        siteTitle,
+        options,
+        status: 'ready',
+        lastEvent: readyEvent,
+        tempRoot,
+        siteDir,
+        zipPath,
+        zipFilename,
+        originalScreenshotPath: path.join(tempRoot, '_original-preview.png'),
+        hasOriginalScreenshot: false,
+        captureMode,
+        files,
+        diagnostics: readyEvent.diagnostics!,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + JOB_TTL_MS,
+        cleaned: false,
+        subscribers: new Set(),
+      };
+
+      jobs.set(jobId, restoredJob);
+      await saveJobMetaToDisk(restoredJob);
+
+      res.json({
+        jobId,
+        previewToken: issueJobPreviewToken(ownerUid, jobId),
+        event: readyEvent,
+        siteTitle,
+        hostname,
+        zipFilename,
+        files,
+        diagnostics: restoredJob.diagnostics,
+        hasOriginalScreenshot: false,
+        captureMode,
+      });
+    } catch {
+      await fsp.rm(tempRoot, { recursive: true, force: true }).catch(() => {});
+      res.status(500).json({ error: 'Failed to restore saved project preview.' });
+    }
+  });
+
+  app.post('/api/capture/:jobId/preview-token', requireAuth, async (req: Request, res: Response) => {
+    const job = await loadOrGetJob(String(req.params.jobId));
+    if (!job || job.ownerUid !== req.authUser!.uid || job.cleaned || job.status !== 'ready') {
+      res.status(404).json({ error: 'Preview workspace unavailable or expired.' });
+      return;
+    }
+    res.json({
+      previewToken: issueJobPreviewToken(req.authUser!.uid, job.id),
+    });
+  });
+
   // Serve original rendered screenshot for Original vs. Captured comparison
   app.get('/api/capture/:jobId/original-screenshot', requireAuth, async (req: Request, res: Response) => {
-    const job = jobs.get(String(req.params.jobId));
+    const job = await loadOrGetJob(String(req.params.jobId));
     if (!job || job.ownerUid !== req.authUser!.uid || job.cleaned || !job.hasOriginalScreenshot) {
       res.status(404).send('Original screenshot unavailable.');
       return;
@@ -720,7 +1099,7 @@ export function createSiteGrabServer(): Express {
 
   // Read individual captured text file safely for inspection / AI context
   app.get('/api/capture/:jobId/file', requireAuth, async (req: Request, res: Response) => {
-    const job = jobs.get(String(req.params.jobId));
+    const job = await loadOrGetJob(String(req.params.jobId));
     if (!job || job.ownerUid !== req.authUser!.uid || job.cleaned || job.status !== 'ready') {
       res.status(404).json({ error: 'Workspace not found or expired.' });
       return;
@@ -750,7 +1129,7 @@ export function createSiteGrabServer(): Express {
 
   // Optional Gemini AI Code Assistant operating on real captured files
   app.post('/api/capture/:jobId/ai', requireAuth, async (req: Request, res: Response) => {
-    const job = jobs.get(String(req.params.jobId));
+    const job = await loadOrGetJob(String(req.params.jobId));
     if (!job || job.ownerUid !== req.authUser!.uid || job.cleaned || job.status !== 'ready') {
       res.status(404).json({ error: 'Capture workspace expired or not ready. Please recapture the site.' });
       return;
@@ -806,7 +1185,7 @@ export function createSiteGrabServer(): Express {
 
   // Apply AI-suggested file modifications to the captured project and rebuild ZIP
   app.post('/api/capture/:jobId/apply-edits', requireAuth, async (req: Request, res: Response) => {
-    const job = jobs.get(String(req.params.jobId));
+    const job = await loadOrGetJob(String(req.params.jobId));
     if (!job || job.ownerUid !== req.authUser!.uid || job.cleaned || job.status !== 'ready') {
       res.status(404).json({ error: 'Capture workspace expired or not ready.' });
       return;
@@ -865,6 +1244,7 @@ export function createSiteGrabServer(): Express {
       job.lastEvent.stats.zipBytes = zipBytes;
       job.lastEvent.files = job.files;
       job.expiresAt = Date.now() + JOB_TTL_MS;
+      await saveJobMetaToDisk(job);
 
       res.json({
         appliedFiles,
@@ -880,22 +1260,13 @@ export function createSiteGrabServer(): Express {
     }
   });
 
-  // Sandboxed live preview of the captured site (owner-scoped via HttpOnly preview cookie or Bearer token)
-  app.get('/api/capture/:jobId/preview/*', async (req: Request, res: Response) => {
-    const sessionUid = await getPreviewSessionUid(req);
-    if (!sessionUid) {
-      res.status(401).send('Sign in required to preview private workspaces.');
-      return;
-    }
-    const job = jobs.get(String(req.params.jobId));
-    if (!job || job.ownerUid !== sessionUid || job.cleaned || job.status !== 'ready') {
-      res.status(404).send('Preview unavailable or archive expired.');
-      return;
-    }
-
-    const relRequested = req.params[0] || '';
+  async function servePreviewAsset(
+    job: CaptureJob,
+    relRequested: string,
+    req: Request,
+    res: Response,
+  ): Promise<void> {
     const cleanRel = relRequested.replace(/^\/+/, '') || 'index.html';
-
     const baseDir = path.resolve(job.siteDir);
     let targetPath = path.resolve(baseDir, cleanRel);
 
@@ -917,30 +1288,89 @@ export function createSiteGrabServer(): Express {
       const ext = path.extname(targetPath).toLowerCase();
       res.setHeader('Content-Type', MIME_MAP[ext] || 'application/octet-stream');
       res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('Referrer-Policy', 'no-referrer');
+      res.setHeader('Access-Control-Allow-Origin', '*');
       const hostHeader = req.get('x-forwarded-host') || req.get('host');
       const protoHeader = (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
       const originSource = hostHeader ? `${protoHeader}://${hostHeader} http://${hostHeader}` : '';
       res.setHeader(
         'Content-Security-Policy',
-        `default-src 'self' ${originSource} data: blob: 'unsafe-inline' 'unsafe-eval'; connect-src 'none';`,
+        `default-src 'self' ${originSource} data: blob: 'unsafe-inline' 'unsafe-eval'; img-src * data: blob:; font-src 'self' ${originSource} data: blob:; connect-src 'none';`,
       );
       fs.createReadStream(targetPath).pipe(res);
     } catch {
       res.status(404).send('File not found in captured archive.');
     }
+  }
+
+  // Cookie-free signed path preview (works inside opaque sandboxed iframes & nested embeds)
+  app.get('/api/capture/:jobId/p/:previewToken/*', async (req: Request, res: Response) => {
+    const jobId = String(req.params.jobId);
+    const token = String(req.params.previewToken || '');
+    const tokenUid = verifyJobPreviewToken(token, jobId);
+    if (!tokenUid) {
+      res.status(401).send('Preview session expired. Click Recapture or reload preview.');
+      return;
+    }
+    const job = await loadOrGetJob(jobId);
+    if (!job || job.ownerUid !== tokenUid || job.cleaned || job.status !== 'ready') {
+      res.status(404).send('Preview unavailable or archive expired.');
+      return;
+    }
+    await servePreviewAsset(job, req.params[0] || 'index.html', req, res);
   });
 
-  app.get('/api/capture/:jobId/preview', async (req: Request, res: Response) => {
-    const sessionUid = await getPreviewSessionUid(req);
+  app.get('/api/capture/:jobId/p/:previewToken', async (req: Request, res: Response) => {
+    const jobId = String(req.params.jobId);
+    const token = String(req.params.previewToken || '');
+    const tokenUid = verifyJobPreviewToken(token, jobId);
+    if (!tokenUid) {
+      res.status(401).send('Preview session expired. Click Recapture or reload preview.');
+      return;
+    }
+    const job = await loadOrGetJob(jobId);
+    if (!job || job.ownerUid !== tokenUid || job.cleaned || job.status !== 'ready') {
+      res.status(404).send('Preview unavailable or archive expired.');
+      return;
+    }
+    res.redirect(
+      302,
+      `/api/capture/${encodeURIComponent(jobId)}/p/${encodeURIComponent(token)}/index.html`,
+    );
+  });
+
+  // Legacy cookie / query-token preview route
+  app.get('/api/capture/:jobId/preview/*', async (req: Request, res: Response) => {
+    const jobId = String(req.params.jobId);
+    const sessionUid = await getPreviewSessionUid(req, jobId);
     if (!sessionUid) {
       res.status(401).send('Sign in required to preview private workspaces.');
       return;
     }
-    res.redirect(302, `/api/capture/${encodeURIComponent(String(req.params.jobId))}/preview/index.html`);
+    const job = await loadOrGetJob(jobId);
+    if (!job || job.ownerUid !== sessionUid || job.cleaned || job.status !== 'ready') {
+      res.status(404).send('Preview unavailable or archive expired.');
+      return;
+    }
+    await servePreviewAsset(job, req.params[0] || 'index.html', req, res);
+  });
+
+  app.get('/api/capture/:jobId/preview', async (req: Request, res: Response) => {
+    const jobId = String(req.params.jobId);
+    const sessionUid = await getPreviewSessionUid(req, jobId);
+    if (!sessionUid) {
+      res.status(401).send('Sign in required to preview private workspaces.');
+      return;
+    }
+    const suffix =
+      typeof req.query.pt === 'string' && req.query.pt
+        ? `?pt=${encodeURIComponent(req.query.pt)}`
+        : '';
+    res.redirect(302, `/api/capture/${encodeURIComponent(jobId)}/preview/index.html${suffix}`);
   });
 
   app.head('/api/capture/:jobId/download', requireAuth, async (req: Request, res: Response) => {
-    const job = jobs.get(String(req.params.jobId));
+    const job = await loadOrGetJob(String(req.params.jobId));
     if (!job || job.ownerUid !== req.authUser!.uid || job.cleaned || job.status !== 'ready') {
       res.status(404).end();
       return;
@@ -958,7 +1388,7 @@ export function createSiteGrabServer(): Express {
 
   // Stream ZIP archive cleanly while preserving workspace for preview & AI edits during TTL
   app.get('/api/capture/:jobId/download', requireAuth, async (req: Request, res: Response) => {
-    const job = jobs.get(String(req.params.jobId));
+    const job = await loadOrGetJob(String(req.params.jobId));
     if (!job || job.ownerUid !== req.authUser!.uid) {
       res.status(404).json({ error: 'Archive not found or expired. Click Recapture to regenerate it.' });
       return;

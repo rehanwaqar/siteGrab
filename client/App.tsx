@@ -24,7 +24,7 @@ import { AuthGate } from './components/AuthGate';
 import { FailureRecoveryPanel, type RecoveryRetrySettings } from './components/FailureRecoveryPanel';
 import { FeedbackView } from './components/FeedbackView';
 import { GuideView } from './components/GuideView';
-import { HistoryView } from './components/HistoryView';
+import { HistoryView, type HistoryPreviewWorkspace } from './components/HistoryView';
 import { PreviewPanel } from './components/PreviewPanel';
 import { ProgressPanel } from './components/ProgressPanel';
 import { ResultsDashboard } from './components/ResultsDashboard';
@@ -34,7 +34,9 @@ import {
   auth,
   clearUserSnapshots,
   getAuthHeaders,
+  getUserSnapshotBundle,
   saveUserSnapshot,
+  saveUserSnapshotBundle,
   signOutAccount,
   subscribeToUserSnapshots,
   syncPreviewSessionCookie,
@@ -43,11 +45,13 @@ import {
 import type {
   ActiveView,
   CapturedFileEntry,
+  CaptureMode,
   CaptureOptions,
   CaptureStats,
   DiagnosticReport,
   HistoryEntry,
   ProgressEvent,
+  SavedPreviewBundle,
 } from './types';
 import {
   formatBytes,
@@ -90,6 +94,7 @@ export default function App() {
   const [chromiumMissing, setChromiumMissing] = useState<boolean>(false);
   const [isCapturing, setIsCapturing] = useState<boolean>(false);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [activePreviewToken, setActivePreviewToken] = useState<string | null>(null);
   const [activeHostname, setActiveHostname] = useState<string>('');
   const [siteTitle, setSiteTitle] = useState<string>('');
   const [zipFilename, setZipFilename] = useState<string>('');
@@ -113,6 +118,11 @@ export default function App() {
   const [showAccountModal, setShowAccountModal] = useState<boolean>(false);
   const [, setProfileVersion] = useState<number>(0);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [historyPreview, setHistoryPreview] = useState<HistoryPreviewWorkspace | null>(null);
+  const [loadingHistoryPreviewId, setLoadingHistoryPreviewId] = useState<string | null>(null);
+  const [historyPreviewUnavailableEntry, setHistoryPreviewUnavailableEntry] =
+    useState<HistoryEntry | null>(null);
+  const [historyPreviewError, setHistoryPreviewError] = useState<string | null>(null);
 
   const currentUserRef = useRef<User | null>(null);
   currentUserRef.current = currentUser;
@@ -163,6 +173,7 @@ export default function App() {
         setIsCapturing(false);
         setIsProcessingUpload(false);
         setActiveJobId(null);
+        setActivePreviewToken(null);
         setActiveHostname('');
         setSiteTitle('');
         setZipFilename('');
@@ -174,6 +185,10 @@ export default function App() {
         setDownloadComplete(false);
         setDownloadError(null);
         setHistory([]);
+        setHistoryPreview(null);
+        setLoadingHistoryPreviewId(null);
+        setHistoryPreviewUnavailableEntry(null);
+        setHistoryPreviewError(null);
       }
     });
 
@@ -221,6 +236,22 @@ export default function App() {
       closeActiveStream();
     };
   }, [closeActiveStream]);
+
+  const persistJobBundleToFirestore = useCallback(async (uid: string, jobId: string) => {
+    try {
+      const authHeaders = await getAuthHeaders();
+      const res = await fetch(`/api/capture/${encodeURIComponent(jobId)}/bundle`, {
+        headers: authHeaders,
+      });
+      if (!res.ok) return;
+      const bundle = (await res.json()) as SavedPreviewBundle;
+      if (Array.isArray(bundle.files) && bundle.files.length > 0) {
+        await saveUserSnapshotBundle(uid, jobId, bundle);
+      }
+    } catch (err) {
+      console.error('Failed to persist preview bundle to Firestore:', err);
+    }
+  }, []);
 
   const handleSignOut = async () => {
     closeActiveStream();
@@ -313,6 +344,7 @@ export default function App() {
     let resolvedFiles: CapturedFileEntry[] = event.files ?? [];
     let resolvedDiagnostics: DiagnosticReport = event.diagnostics ?? EMPTY_DIAGNOSTICS;
     let resolvedHasShot = Boolean(event.hasOriginalScreenshot);
+    let resolvedPreviewToken: string | null = null;
 
     try {
       await syncPreviewSessionCookie();
@@ -324,12 +356,14 @@ export default function App() {
         const statusData = (await statusRes.json()) as {
           siteTitle?: string;
           zipFilename?: string;
+          previewToken?: string;
           files?: CapturedFileEntry[];
           diagnostics?: DiagnosticReport;
           hasOriginalScreenshot?: boolean;
         };
         if (statusData.siteTitle) resolvedTitle = statusData.siteTitle;
         if (statusData.zipFilename) resolvedZip = statusData.zipFilename;
+        if (statusData.previewToken) resolvedPreviewToken = statusData.previewToken;
         if (Array.isArray(statusData.files)) resolvedFiles = statusData.files;
         if (statusData.diagnostics) resolvedDiagnostics = statusData.diagnostics;
         if (typeof statusData.hasOriginalScreenshot === 'boolean') {
@@ -342,6 +376,7 @@ export default function App() {
 
     setSiteTitle(resolvedTitle);
     setZipFilename(resolvedZip);
+    setActivePreviewToken(resolvedPreviewToken);
     setCapturedFiles(resolvedFiles);
     setDiagnostics(resolvedDiagnostics);
     setHasOriginalScreenshot(resolvedHasShot);
@@ -360,9 +395,11 @@ export default function App() {
 
     const user = currentUserRef.current;
     if (user) {
-      void saveUserSnapshot(user.uid, newEntry).catch((err) => {
-        console.error('Failed to persist snapshot to Firestore:', err);
-      });
+      void saveUserSnapshot(user.uid, newEntry)
+        .then(() => persistJobBundleToFirestore(user.uid, jobId))
+        .catch((err) => {
+          console.error('Failed to persist snapshot to Firestore:', err);
+        });
     }
 
     if (autoDownloadRef.current) {
@@ -401,6 +438,7 @@ export default function App() {
       setErrorState(null);
       setProgressEvent(null);
       setActiveJobId(null);
+      setActivePreviewToken(null);
       setCapturedFiles([]);
       setDiagnostics(EMPTY_DIAGNOSTICS);
       setHasOriginalScreenshot(false);
@@ -591,6 +629,7 @@ export default function App() {
       hostname?: string;
       siteTitle?: string;
       zipFilename?: string;
+      previewToken?: string;
       event?: ProgressEvent;
       error?: string;
     };
@@ -608,6 +647,7 @@ export default function App() {
 
     setErrorState(null);
     setActiveJobId(data.jobId);
+    setActivePreviewToken(data.previewToken ?? null);
     setActiveHostname(host);
     setSiteTitle(resolvedTitle);
     setZipFilename(resolvedZip);
@@ -638,9 +678,11 @@ export default function App() {
     };
     const user = currentUserRef.current;
     if (user) {
-      void saveUserSnapshot(user.uid, importedEntry).catch((err) => {
-        console.error('Failed to persist ZIP snapshot to Firestore:', err);
-      });
+      void saveUserSnapshot(user.uid, importedEntry)
+        .then(() => persistJobBundleToFirestore(user.uid, data.jobId!))
+        .catch((err) => {
+          console.error('Failed to persist ZIP snapshot to Firestore:', err);
+        });
     }
 
     if (autoDownloadRef.current) {
@@ -656,6 +698,7 @@ export default function App() {
     setCapturedFiles([]);
     setDiagnostics(EMPTY_DIAGNOSTICS);
     setActiveJobId(null);
+    setActivePreviewToken(null);
     setActiveHostname(file.name);
     setProgressEvent({
       jobId: 'screenshot-pending',
@@ -704,6 +747,7 @@ export default function App() {
       hostname?: string;
       siteTitle?: string;
       zipFilename?: string;
+      previewToken?: string;
       event?: ProgressEvent;
       error?: string;
     };
@@ -722,6 +766,7 @@ export default function App() {
 
     setErrorState(null);
     setActiveJobId(data.jobId);
+    setActivePreviewToken(data.previewToken ?? null);
     setActiveHostname(host);
     setSiteTitle(resolvedTitle);
     setZipFilename(resolvedZip);
@@ -753,9 +798,11 @@ export default function App() {
     };
     const user = currentUserRef.current;
     if (user) {
-      void saveUserSnapshot(user.uid, generatedEntry).catch((err) => {
-        console.error('Failed to persist screenshot snapshot to Firestore:', err);
-      });
+      void saveUserSnapshot(user.uid, generatedEntry)
+        .then(() => persistJobBundleToFirestore(user.uid, data.jobId!))
+        .catch((err) => {
+          console.error('Failed to persist screenshot snapshot to Firestore:', err);
+        });
     }
 
     if (autoDownloadRef.current) {
@@ -837,16 +884,151 @@ export default function App() {
     }
   };
 
+  const restoreWorkspaceForHistoryEntry = useCallback(
+    async (entry: HistoryEntry): Promise<HistoryPreviewWorkspace | null> => {
+      const user = currentUserRef.current;
+      const authHeaders = await getAuthHeaders();
+
+      // 1. Check if workspace is active in server memory or disk cache
+      try {
+        const statusRes = await fetch(`/api/capture/${encodeURIComponent(entry.id)}/status`, {
+          headers: authHeaders,
+        });
+        if (statusRes.ok) {
+          const statusData = (await statusRes.json()) as ProgressEvent & {
+            siteTitle?: string;
+            hostname?: string;
+            zipFilename?: string;
+            previewToken?: string;
+          };
+          if (statusData.stage === 'ready') {
+            return {
+              entryId: entry.id,
+              jobId: entry.id,
+              previewToken: statusData.previewToken ?? null,
+              siteTitle: statusData.siteTitle || entry.siteTitle || entry.hostname,
+              hostname: statusData.hostname || entry.hostname,
+              zipFilename: statusData.zipFilename || entry.zipFilename,
+              event: statusData,
+              files: statusData.files ?? [],
+              diagnostics: statusData.diagnostics ?? EMPTY_DIAGNOSTICS,
+              hasOriginalScreenshot: Boolean(statusData.hasOriginalScreenshot),
+            };
+          }
+        }
+      } catch {
+        // Fall through to Firestore saved bundle restoration
+      }
+
+      // 2. Restore saved source bundle from private Firestore snapshot subcollection
+      if (!user) return null;
+      const savedBundle = await getUserSnapshotBundle(user.uid, entry.id);
+      if (!savedBundle || savedBundle.files.length === 0) {
+        return null;
+      }
+
+      const restoreRes = await fetch('/api/capture/restore', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...authHeaders,
+        },
+        body: JSON.stringify({
+          snapshotId: entry.id,
+          url: entry.url,
+          hostname: entry.hostname,
+          siteTitle: entry.siteTitle,
+          zipFilename: entry.zipFilename,
+          captureMode: savedBundle.captureMode,
+          stats: entry.stats,
+          options: entry.options,
+          files: savedBundle.files,
+        }),
+      });
+
+      if (!restoreRes.ok) {
+        return null;
+      }
+
+      const restored = (await restoreRes.json()) as {
+        jobId: string;
+        previewToken?: string;
+        event: ProgressEvent;
+        siteTitle?: string;
+        hostname?: string;
+        zipFilename?: string;
+        files?: CapturedFileEntry[];
+        diagnostics?: DiagnosticReport;
+        hasOriginalScreenshot?: boolean;
+        captureMode?: CaptureMode;
+      };
+
+      return {
+        entryId: entry.id,
+        jobId: restored.jobId,
+        previewToken: restored.previewToken ?? null,
+        siteTitle: restored.siteTitle || entry.siteTitle || entry.hostname,
+        hostname: restored.hostname || entry.hostname,
+        zipFilename: restored.zipFilename || entry.zipFilename,
+        event: {
+          ...restored.event,
+          captureMode: restored.captureMode ?? savedBundle.captureMode,
+        },
+        files: restored.files ?? [],
+        diagnostics: restored.diagnostics ?? EMPTY_DIAGNOSTICS,
+        hasOriginalScreenshot: Boolean(restored.hasOriginalScreenshot),
+      };
+    },
+    [],
+  );
+
+  const handlePreviewHistoryEntry = async (entry: HistoryEntry) => {
+    setLoadingHistoryPreviewId(entry.id);
+    setHistoryPreviewUnavailableEntry(null);
+    setHistoryPreviewError(null);
+    setDownloadComplete(false);
+    setDownloadError(null);
+
+    try {
+      await syncPreviewSessionCookie();
+      const workspace = await restoreWorkspaceForHistoryEntry(entry);
+      if (workspace) {
+        setHistoryPreview(workspace);
+      } else {
+        setHistoryPreview(null);
+        setHistoryPreviewUnavailableEntry(entry);
+      }
+    } catch (err) {
+      setHistoryPreview(null);
+      setHistoryPreviewUnavailableEntry(entry);
+      setHistoryPreviewError(
+        err instanceof Error ? err.message : 'Unable to load preview for this history project.',
+      );
+    } finally {
+      setLoadingHistoryPreviewId(null);
+    }
+  };
+
   const handleDownloadFromHistory = async (entry: HistoryEntry) => {
     const ok = await downloadZipByJobId(entry.id, entry.zipFilename);
-    if (!ok) {
-      // Server archive expired after TTL — load in Capture tab and show friendly prompt to recapture
-      handleLoadFromHistory(entry, false);
-      setErrorState({
-        code: 'EXPIRED',
-        message: `The temporary server archive for ${entry.hostname} has expired. Click Retry Capture to regenerate it with your saved settings.`,
-      });
+    if (ok) return;
+
+    // Try restoring from saved Firestore preview bundle before falling back to Recapture
+    try {
+      const workspace = await restoreWorkspaceForHistoryEntry(entry);
+      if (workspace) {
+        const restoredOk = await downloadZipByJobId(workspace.jobId, workspace.zipFilename);
+        if (restoredOk) return;
+      }
+    } catch {
+      // Fall through cleanly to recapture prompt
     }
+
+    handleLoadFromHistory(entry, false);
+    setErrorState({
+      code: 'EXPIRED',
+      message: `The temporary server archive for ${entry.hostname} has expired. Click Retry Capture to regenerate it with your saved settings.`,
+    });
   };
 
   const handleWorkspaceUpdated = (payload: {
@@ -865,6 +1047,38 @@ export default function App() {
           }
         : prev,
     );
+    const user = currentUserRef.current;
+    if (user && activeJobId) {
+      void persistJobBundleToFirestore(user.uid, activeJobId);
+    }
+  };
+
+  const handleHistoryWorkspaceUpdated = (
+    jobId: string,
+    payload: {
+      files: CapturedFileEntry[];
+      stats: CaptureStats;
+      appliedFiles: string[];
+    },
+  ) => {
+    setDownloadComplete(false);
+    setHistoryPreview((prev) =>
+      prev && prev.jobId === jobId
+        ? {
+            ...prev,
+            files: payload.files,
+            event: {
+              ...prev.event,
+              stats: payload.stats,
+              files: payload.files,
+            },
+          }
+        : prev,
+    );
+    const user = currentUserRef.current;
+    if (user) {
+      void persistJobBundleToFirestore(user.uid, jobId);
+    }
   };
 
   return (
@@ -1018,9 +1232,30 @@ export default function App() {
             {activeView === 'history' && (
               <HistoryView
                 history={history}
+                activePreview={historyPreview}
+                loadingPreviewId={loadingHistoryPreviewId}
+                previewUnavailableEntry={historyPreviewUnavailableEntry}
+                previewError={historyPreviewError}
+                isDownloading={isDownloading}
+                downloadPercent={downloadPercent}
+                downloadComplete={downloadComplete}
+                downloadError={downloadError}
+                onPreviewHistoryEntry={(entry) => void handlePreviewHistoryEntry(entry)}
+                onClosePreview={() => {
+                  setHistoryPreview(null);
+                  setHistoryPreviewUnavailableEntry(null);
+                  setHistoryPreviewError(null);
+                }}
                 onRecapture={handleLoadFromHistory}
                 onDownloadHistoryEntry={(entry) => void handleDownloadFromHistory(entry)}
+                onDownloadActivePreview={(jobId, zipName) =>
+                  void downloadZipByJobId(jobId, zipName)
+                }
+                onWorkspaceUpdated={handleHistoryWorkspaceUpdated}
                 onClearHistory={() => {
+                  setHistoryPreview(null);
+                  setHistoryPreviewUnavailableEntry(null);
+                  setHistoryPreviewError(null);
                   if (currentUser) {
                     void clearUserSnapshots(currentUser.uid).catch((err) => {
                       console.error('Failed to clear history:', err);
@@ -1291,6 +1526,7 @@ export default function App() {
                 <ResultsDashboard stats={progressEvent.stats} hostname={activeHostname} />
                 <PreviewPanel
                   jobId={activeJobId}
+                  previewToken={activePreviewToken}
                   siteTitle={siteTitle}
                   hostname={activeHostname}
                   zipFilename={zipFilename}

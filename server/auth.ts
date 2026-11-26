@@ -215,10 +215,60 @@ export function clearPreviewCookie(res: Response, req: Request): void {
   res.setHeader('Set-Cookie', attrs.join('; '));
 }
 
-export async function getPreviewSessionUid(req: Request): Promise<string | null> {
+export function issueJobPreviewToken(uid: string, jobId: string): string {
+  const exp = Date.now() + PREVIEW_TTL_MS;
+  const payloadB64 = Buffer.from(JSON.stringify({ uid, jobId, exp }), 'utf8').toString('base64url');
+  const sig = crypto.createHmac('sha256', getSigningKey()).update(payloadB64).digest('base64url');
+  return `${payloadB64}.${sig}`;
+}
+
+export function verifyJobPreviewToken(token: string, expectedJobId: string): string | null {
+  const parts = token.split('.');
+  if (parts.length !== 2) return null;
+  const [payloadB64, sigB64] = parts;
+  if (!payloadB64 || !sigB64) return null;
+
+  const expectedSig = crypto
+    .createHmac('sha256', getSigningKey())
+    .update(payloadB64)
+    .digest('base64url');
+
+  const sigBuf = Buffer.from(sigB64);
+  const expBuf = Buffer.from(expectedSig);
+  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as {
+      uid?: unknown;
+      jobId?: unknown;
+      exp?: unknown;
+    };
+    if (
+      typeof parsed.uid !== 'string' ||
+      !parsed.uid ||
+      typeof parsed.jobId !== 'string' ||
+      parsed.jobId !== expectedJobId ||
+      typeof parsed.exp !== 'number' ||
+      Date.now() > parsed.exp
+    ) {
+      return null;
+    }
+    return parsed.uid;
+  } catch {
+    return null;
+  }
+}
+
+export async function getPreviewSessionUid(req: Request, expectedJobId?: string): Promise<string | null> {
   const bearerUser = await verifyBearerUser(req);
   if (bearerUser && bearerUser.emailVerified) {
     return bearerUser.uid;
+  }
+  if (expectedJobId && typeof req.query.pt === 'string' && req.query.pt) {
+    const tokenUid = verifyJobPreviewToken(req.query.pt, expectedJobId);
+    if (tokenUid) return tokenUid;
   }
   const cookies = parseCookies(req.get('cookie'));
   const raw = cookies[PREVIEW_COOKIE_NAME];

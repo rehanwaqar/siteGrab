@@ -159,6 +159,52 @@ service cloud.firestore {
         data.createdAt == request.time;
     }
 
+    // Validation blueprint: SnapshotPreviewBundle (bounded source files for history preview)
+    function isValidSnapshotPreviewBundle(data, userId, snapshotId) {
+      return data.keys().hasAll([
+          'snapshotId',
+          'ownerUid',
+          'captureMode',
+          'totalBytes',
+          'files',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'snapshotId',
+          'ownerUid',
+          'captureMode',
+          'totalBytes',
+          'files',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        isValidId(data.snapshotId) &&
+        data.snapshotId == snapshotId &&
+        isValidId(data.ownerUid) &&
+        data.ownerUid == request.auth.uid &&
+        data.ownerUid == userId &&
+        data.captureMode is string &&
+        data.captureMode.size() >= 1 &&
+        data.captureMode.size() <= 20 &&
+        data.captureMode in ['live', 'clone', 'zip', 'screenshot'] &&
+        isNonNegNumber(data.totalBytes) &&
+        data.totalBytes <= 650000 &&
+        data.files is list &&
+        data.files.size() >= 1 &&
+        data.files.size() <= 40 &&
+        data.files[0] is map &&
+        data.files[0].keys().hasAll(['path', 'content']) &&
+        data.files[0].keys().hasOnly(['path', 'content']) &&
+        data.files[0].path is string &&
+        data.files[0].path.size() >= 1 &&
+        data.files[0].path.size() <= 300 &&
+        data.files[0].content is string &&
+        data.files[0].content.size() <= 500000 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
     match /users/{userId} {
       allow get: if isValidId(userId) && isOwner(userId) && isVerifiedUser();
       allow list: if false;
@@ -207,6 +253,47 @@ service cloud.firestore {
           isOwner(userId) &&
           isVerifiedUser() &&
           existing().ownerUid == request.auth.uid;
+
+        match /bundles/{bundleId} {
+          allow get: if isValidId(userId) &&
+            isValidId(snapshotId) &&
+            isValidId(bundleId) &&
+            isOwner(userId) &&
+            isVerifiedUser() &&
+            existing().ownerUid == request.auth.uid &&
+            get(/databases/$(database)/documents/users/$(userId)/snapshots/$(snapshotId)).data.ownerUid == request.auth.uid;
+
+          allow list: if false;
+
+          allow create: if isValidId(userId) &&
+            isValidId(snapshotId) &&
+            isValidId(bundleId) &&
+            isOwner(userId) &&
+            isVerifiedUser() &&
+            isValidSnapshotPreviewBundle(incoming(), userId, snapshotId) &&
+            incoming().createdAt == request.time &&
+            incoming().updatedAt == request.time &&
+            get(/databases/$(database)/documents/users/$(userId)/snapshots/$(snapshotId)).data.ownerUid == request.auth.uid;
+
+          allow update: if isValidId(userId) &&
+            isValidId(snapshotId) &&
+            isValidId(bundleId) &&
+            isOwner(userId) &&
+            isVerifiedUser() &&
+            isValidSnapshotPreviewBundle(incoming(), userId, snapshotId) &&
+            incoming().snapshotId == existing().snapshotId &&
+            incoming().ownerUid == existing().ownerUid &&
+            incoming().createdAt == existing().createdAt &&
+            incoming().updatedAt == request.time &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['files', 'totalBytes', 'captureMode', 'updatedAt']);
+
+          allow delete: if isValidId(userId) &&
+            isValidId(snapshotId) &&
+            isValidId(bundleId) &&
+            isOwner(userId) &&
+            isVerifiedUser() &&
+            existing().ownerUid == request.auth.uid;
+        }
       }
     }
   }

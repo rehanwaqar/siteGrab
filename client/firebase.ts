@@ -30,7 +30,7 @@ import {
   type FirestoreError,
 } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
-import type { HistoryEntry } from './types';
+import type { CaptureMode, HistoryEntry, SavedPreviewBundle } from './types';
 
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
@@ -434,6 +434,101 @@ export function subscribeToUserSnapshots(
   );
 }
 
+export async function saveUserSnapshotBundle(
+  uid: string,
+  snapshotIdRaw: string,
+  bundle: SavedPreviewBundle,
+): Promise<void> {
+  const snapshotId = sanitizeDocId(snapshotIdRaw);
+  const bundlePath = `users/${uid}/snapshots/${snapshotId}/bundles/preview`;
+  const bundleRef = doc(db, 'users', uid, 'snapshots', snapshotId, 'bundles', 'preview');
+
+  const textEncoder = new TextEncoder();
+  const sanitizedFiles: Array<{ path: string; content: string }> = [];
+  let totalBytes = 0;
+
+  for (const item of bundle.files || []) {
+    if (sanitizedFiles.length >= 40) break;
+    if (!item || typeof item.path !== 'string' || typeof item.content !== 'string') continue;
+    const cleanPath = item.path.trim().slice(0, 300);
+    if (!cleanPath) continue;
+    const byteSize = textEncoder.encode(item.content).length;
+    if (byteSize > 450_000 || totalBytes + byteSize > 650_000) continue;
+    sanitizedFiles.push({ path: cleanPath, content: item.content });
+    totalBytes += byteSize;
+  }
+
+  if (sanitizedFiles.length === 0) return;
+
+  const captureMode: CaptureMode =
+    bundle.captureMode === 'clone' ||
+    bundle.captureMode === 'zip' ||
+    bundle.captureMode === 'screenshot'
+      ? bundle.captureMode
+      : 'live';
+
+  try {
+    const existing = await getDoc(bundleRef);
+    if (!existing.exists()) {
+      await setDoc(bundleRef, {
+        snapshotId,
+        ownerUid: uid,
+        captureMode,
+        totalBytes,
+        files: sanitizedFiles,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      await updateDoc(bundleRef, {
+        captureMode,
+        totalBytes,
+        files: sanitizedFiles,
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, bundlePath);
+  }
+}
+
+export async function getUserSnapshotBundle(
+  uid: string,
+  snapshotIdRaw: string,
+): Promise<SavedPreviewBundle | null> {
+  const snapshotId = sanitizeDocId(snapshotIdRaw);
+  const bundlePath = `users/${uid}/snapshots/${snapshotId}/bundles/preview`;
+  const bundleRef = doc(db, 'users', uid, 'snapshots', snapshotId, 'bundles', 'preview');
+
+  try {
+    const snap = await getDoc(bundleRef);
+    if (!snap.exists()) return null;
+    const d = snap.data();
+    const rawFiles = Array.isArray(d.files) ? d.files : [];
+    const files = rawFiles
+      .filter(
+        (f): f is { path: string; content: string } =>
+          Boolean(f) && typeof f.path === 'string' && typeof f.content === 'string',
+      )
+      .map((f) => ({ path: f.path, content: f.content }));
+
+    if (files.length === 0) return null;
+
+    const captureMode: CaptureMode =
+      d.captureMode === 'clone' || d.captureMode === 'zip' || d.captureMode === 'screenshot'
+        ? d.captureMode
+        : 'live';
+
+    return {
+      captureMode,
+      totalBytes: Number(d.totalBytes || 0),
+      files,
+    };
+  } catch (err) {
+    handleFirestoreError(err, OperationType.GET, bundlePath);
+  }
+}
+
 export async function clearUserSnapshots(uid: string): Promise<void> {
   const snapshotsPath = `users/${uid}/snapshots`;
   try {
@@ -442,6 +537,7 @@ export async function clearUserSnapshots(uid: string): Promise<void> {
     if (snap.empty) return;
     const batch = writeBatch(db);
     snap.docs.forEach((docSnap) => {
+      batch.delete(doc(db, 'users', uid, 'snapshots', docSnap.id, 'bundles', 'preview'));
       batch.delete(docSnap.ref);
     });
     await batch.commit();

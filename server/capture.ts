@@ -317,6 +317,8 @@ export async function runCaptureJob(
   const brokenImages: Array<{ src: string; page: string; reason: string }> = [];
   const unresolvedLinks: Array<{ href: string; page: string; type: 'asset' | 'navigation' }> = [];
   const intentionallyBlockedUrls = new Set<string>();
+  let partialHtml = '';
+  let partialScreenshot: Buffer | null = null;
 
   const recordFailedResource = (entry: FailedResourceEntry) => {
     if (failedSeen.has(entry.url) || failedResources.length >= 100) return;
@@ -616,7 +618,7 @@ export async function runCaptureJob(
         current.url,
       );
 
-      const pageGotoTimeout = effectiveTimeoutMs > 60_000 ? 40_000 : 18_000;
+      const pageGotoTimeout = effectiveTimeoutMs > 60_000 ? 45_000 : 28_000;
       let mainResponse: PwResponse | null = null;
       try {
         mainResponse = await page.goto(current.url, {
@@ -629,7 +631,7 @@ export async function runCaptureJob(
           try {
             mainResponse = await page.goto(current.url, {
               waitUntil: 'domcontentloaded',
-              timeout: 12_000,
+              timeout: 16_000,
             });
           } catch {
             // Fall through to readyState check
@@ -703,10 +705,16 @@ export async function runCaptureJob(
             const fbCt = (fbRes.headers.get('content-type') || '').toLowerCase();
             if (fbRes.ok && fbCt.includes('text/html') && !isPrivateOrAuthHost(fbUrl)) {
               const fbHtml = await fbRes.text();
+              const $fbProbe = cheerio.load(fbHtml);
+              $fbProbe('script, style, noscript, template').remove();
+              const visibleTextLen = $fbProbe('body').text().replace(/\s+/g, ' ').trim().length;
               const looksLikeChallenge =
                 fbRes.headers.get('cf-mitigated') === 'challenge' ||
                 /Just a moment\.\.\.|Enable JavaScript and cookies to continue/i.test(fbHtml);
-              if (fbHtml.trim().length > 80 && !looksLikeChallenge) {
+              if (fbHtml.trim().length > 120 && !looksLikeChallenge) {
+                partialHtml = fbHtml;
+              }
+              if (visibleTextLen >= 80 && !looksLikeChallenge) {
                 const fbOrigin = new URL(fbUrl).origin;
                 const $fb = cheerio.load(fbHtml);
                 const subAssetTargets: Array<{ url: string; resourceType: string }> = [];
@@ -821,6 +829,15 @@ export async function runCaptureJob(
       const finalPageUrl = landedUrl;
       await validateExternalUrl(finalPageUrl, validatedHostCache);
 
+      // Allow client-rendered SPAs a brief moment to mount visible content if DOM is initially sparse
+      await page
+        .waitForFunction(
+          () => (document.body?.innerText?.trim().length || 0) >= 40,
+          undefined,
+          { timeout: 3500 },
+        )
+        .catch(() => {});
+
       // Scroll page quickly to trigger lazy-loaded images & chunks
       await page.evaluate(async () => {
         const scrollStep = Math.max(700, Math.floor(window.innerHeight));
@@ -832,8 +849,8 @@ export async function runCaptureJob(
         window.scrollTo(0, 0);
       });
 
-      await page.waitForLoadState('networkidle', { timeout: 1500 }).catch(() => {});
-      await new Promise((r) => setTimeout(r, 120));
+      await page.waitForLoadState('networkidle', { timeout: 2000 }).catch(() => {});
+      await new Promise((r) => setTimeout(r, 150));
       await Promise.allSettled(pendingAssetReads.splice(0));
 
       checkAborted();
@@ -899,6 +916,35 @@ export async function runCaptureJob(
 
       const html = await page.content();
       const title = (await page.title().catch(() => '')) || currentParsed.hostname;
+
+      if (pages.length === 0) {
+        const probe = await page
+          .evaluate(() => {
+            const txt = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+            const visualCount = document.querySelectorAll('img, svg, canvas, video').length;
+            return { len: txt.length, snippet: txt.slice(0, 600), visualCount };
+          })
+          .catch(() => ({ len: 0, snippet: '', visualCount: 0 }));
+
+        const isChallengePage =
+          /Just a moment\.\.\.|Attention Required! \| Cloudflare|Checking your browser before accessing|Enable JavaScript and cookies to continue|Verify you are human/i.test(
+            `${title} ${probe.snippet}`,
+          );
+
+        if (isChallengePage) {
+          throw new CaptureError(
+            'ACCESS_DENIED',
+            'Target website presented a browser verification challenge instead of page content.',
+          );
+        }
+
+        if (probe.len < 25 && probe.visualCount < 2) {
+          throw new CaptureError(
+            'NAVIGATION_ERROR',
+            'Target page rendered empty content in headless browser.',
+          );
+        }
+      }
 
       const htmlBytes = Buffer.byteLength(html, 'utf8');
       if (!consumeBudget(htmlBytes, 1)) {
@@ -1124,6 +1170,23 @@ export async function runCaptureJob(
                 err instanceof Error ? err.message : 'An unexpected error occurred during capture.',
               );
 
+    // Preserve any partially rendered HTML or screenshot from Playwright before closing browser
+    if (context && !partialHtml) {
+      try {
+        const openPages = context.pages();
+        if (openPages.length > 0) {
+          const p = openPages[0];
+          const maybeHtml = await p.content().catch(() => '');
+          if (maybeHtml && maybeHtml.length > 150 && !/Just a moment\.\.\./i.test(maybeHtml)) {
+            partialHtml = maybeHtml;
+            partialScreenshot = await p.screenshot({ type: 'png' }).catch(() => null);
+          }
+        }
+      } catch {
+        // Ignore partial capture errors
+      }
+    }
+
     // Close Playwright resources immediately before any fallback generation
     if (context) {
       await context.close().catch(() => {});
@@ -1147,19 +1210,22 @@ export async function runCaptureJob(
       try {
         emit(
           'capturing',
-          'Direct capture hit an error — creating a clean static clone instead...',
+          'Direct capture hit an error — building a complete interactive website clone...',
           68,
           captureErr.message,
         );
         await generateCloneFallbackForUrl({
           targetUrl: job.url,
           failureReason: captureErr.message,
+          partialHtml: partialHtml || undefined,
+          partialScreenshot,
+          validatedHostCache,
           job,
           stats,
         });
         emit(
           'ready',
-          'Fallback website clone complete. Preview your files or click Download ZIP when ready.',
+          'Website build complete. Preview your files or click Download ZIP when ready.',
           100,
           captureErr.message,
         );

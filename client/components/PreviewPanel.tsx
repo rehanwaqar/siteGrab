@@ -27,6 +27,7 @@ import { AiAssistantPanel } from './AiAssistantPanel';
 
 interface PreviewPanelProps {
   jobId: string;
+  previewToken?: string | null;
   siteTitle: string;
   hostname: string;
   zipFilename: string;
@@ -51,6 +52,7 @@ const INSPECTABLE_EXTS = ['.html', '.htm', '.css', '.js', '.mjs', '.json', '.md'
 
 export function PreviewPanel({
   jobId,
+  previewToken: propPreviewToken,
   siteTitle,
   hostname,
   zipFilename,
@@ -70,6 +72,9 @@ export function PreviewPanel({
   const [viewportMode, setViewportMode] = useState<'desktop' | 'tablet' | 'mobile'>('desktop');
   const [compareMode, setCompareMode] = useState<boolean>(false);
   const [previewRevision, setPreviewRevision] = useState<number>(0);
+  const [resolvedPreviewToken, setResolvedPreviewToken] = useState<string | null>(
+    propPreviewToken ?? null,
+  );
   const [originalScreenshotBlobUrl, setOriginalScreenshotBlobUrl] = useState<string | null>(null);
 
   const [inspectedFile, setInspectedFile] = useState<{
@@ -79,7 +84,37 @@ export function PreviewPanel({
     error?: string;
   } | null>(null);
 
-  const previewUrl = `/api/capture/${encodeURIComponent(jobId)}/preview/index.html?rev=${previewRevision}`;
+  useEffect(() => {
+    setResolvedPreviewToken(propPreviewToken ?? null);
+    if (propPreviewToken) return;
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        const authHeaders = await getAuthHeaders();
+        const res = await fetch(
+          `/api/capture/${encodeURIComponent(jobId)}/preview-token`,
+          { method: 'POST', headers: authHeaders },
+        );
+        if (!res.ok || cancelled) return;
+        const data = (await res.json()) as { previewToken?: string };
+        if (!cancelled && data.previewToken) {
+          setResolvedPreviewToken(data.previewToken);
+        }
+      } catch {
+        // Fallback handled gracefully
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [jobId, propPreviewToken]);
+
+  const activeToken = resolvedPreviewToken || propPreviewToken || '';
+  const previewUrl = activeToken
+    ? `/api/capture/${encodeURIComponent(jobId)}/p/${encodeURIComponent(activeToken)}/index.html?rev=${previewRevision}`
+    : null;
   const rootFolder = zipFilename.replace(/\.zip$/i, '') || `sitegrab-${hostname}`;
 
   useEffect(() => {
@@ -393,12 +428,19 @@ export function PreviewPanel({
                 <div className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-[#111827] px-3 py-2 text-xs font-mono text-slate-600 dark:text-slate-300">
                   Captured Offline Bundle ({rootFolder}/index.html)
                 </div>
-                <iframe
-                  title={`Captured preview of ${hostname}`}
-                  src={previewUrl}
-                  sandbox="allow-scripts allow-forms"
-                  className="h-[480px] w-full bg-white"
-                />
+                {previewUrl ? (
+                  <iframe
+                    title={`Captured preview of ${hostname}`}
+                    src={previewUrl}
+                    sandbox="allow-scripts allow-forms"
+                    className="h-[480px] w-full bg-white"
+                  />
+                ) : (
+                  <div className="h-[480px] w-full flex items-center justify-center bg-slate-950 text-xs text-slate-400 gap-2">
+                    <Loader2 className="h-4 w-4 animate-spin text-sky-500" />
+                    <span>Preparing preview...</span>
+                  </div>
+                )}
               </div>
             </div>
           ) : (
@@ -416,12 +458,19 @@ export function PreviewPanel({
                   {rootFolder}/index.html · {viewportMode} viewport
                 </span>
               </div>
-              <iframe
-                title={`Captured preview of ${hostname}`}
-                src={previewUrl}
-                sandbox="allow-scripts allow-forms"
-                className="h-[480px] w-full bg-white"
-              />
+              {previewUrl ? (
+                <iframe
+                  title={`Captured preview of ${hostname}`}
+                  src={previewUrl}
+                  sandbox="allow-scripts allow-forms"
+                  className="h-[480px] w-full bg-white"
+                />
+              ) : (
+                <div className="h-[480px] w-full flex items-center justify-center bg-slate-950 text-xs text-slate-400 gap-2">
+                  <Loader2 className="h-4 w-4 animate-spin text-sky-500" />
+                  <span>Preparing preview...</span>
+                </div>
+              )}
             </div>
           )}
         </div>
