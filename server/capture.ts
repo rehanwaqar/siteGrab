@@ -17,6 +17,7 @@ import {
   rewriteJsUrls,
 } from './rewriter.ts';
 import { fetchRobotsPolicy, isAllowedByRobots } from './robots.ts';
+import { resolveChromiumExecutablePath } from './playwrightExec.ts';
 import { recoverSourceMaps } from './sourcemap.ts';
 import {
   isBlockedIp,
@@ -67,6 +68,9 @@ const PRIVATE_PREVIEW_HOST_RE =
 
 const LOGIN_REDIRECT_RE = /\/(login|signin|sign-in|auth|oauth|sso)(\/|$|\?)/i;
 
+const DYNAMIC_WEB_APP_HOST_RE =
+  /(^|\.)(youtube\.com|youtu\.be|music\.youtube\.com|open\.spotify\.com|spotify\.com|netflix\.com|hulu\.com|disneyplus\.com|soundcloud\.com|vimeo\.com|instagram\.com|x\.com|twitter\.com|threads\.net|facebook\.com|linkedin\.com|pinterest\.com|twitch\.tv|tiktok\.com|discord\.com|reddit\.com|amazon\.com|ebay\.com|etsy\.com|airbnb\.com|github\.com|gitlab\.com|notion\.so|figma\.com|canva\.com|linear\.app|slack\.com)$/i;
+
 function isPrivateOrAuthHost(urlStr: string): boolean {
   try {
     const u = new URL(urlStr);
@@ -81,6 +85,295 @@ function isPrivateOrAuthHost(urlStr: string): boolean {
     return LOGIN_REDIRECT_RE.test(u.pathname);
   } catch {
     return false;
+  }
+}
+
+function isConsentOrDynamicAppShell(
+  urlStr: string,
+  html: string,
+  title: string,
+  textSnippet: string,
+  failedApiCount: number,
+): string | null {
+  try {
+    const u = new URL(urlStr);
+    if (
+      /consent\.(youtube|google)\.com/i.test(u.hostname) ||
+      /Before you continue to (YouTube|Google)|Sign in to confirm you.?re not a bot/i.test(`${title} ${textSnippet}`)
+    ) {
+      return 'Target site presented a consent or verification gate; building a complete working interactive clone.';
+    }
+    if (DYNAMIC_WEB_APP_HOST_RE.test(u.hostname)) {
+      return `Detected interactive web application (${u.hostname}); building a fully working client-side clone with interactive sign-in, media/app controls, and navigation.`;
+    }
+    if (/<ytd-app\b|ytInitialData|<shreddit-app\b/i.test(html)) {
+      return 'Detected dynamic API-driven web application shell; building a fully working offline interactive clone.';
+    }
+    const isSpaShell =
+      /<div id=["'](root|__next|app|__nuxt)["']|__NEXT_DATA__|data-reactroot|ng-version=/i.test(html);
+    if (isSpaShell && failedApiCount >= 2) {
+      return 'Detected client-rendered SPA relying on live API requests; building a self-contained working interactive clone.';
+    }
+  } catch {
+    // Ignore malformed URL
+  }
+  return null;
+}
+
+async function extractVisualBlueprintFromPage(page: import('playwright').Page): Promise<string> {
+  return page
+    .evaluate(() => {
+      const clean = (s: string | null | undefined, max = 90) =>
+        (s || '').replace(/\s+/g, ' ').trim().slice(0, max);
+
+      const isTransparent = (bg: string | undefined | null) =>
+        !bg || bg === 'transparent' || /^rgba\(\s*\d+,\s*\d+,\s*\d+,\s*0(?:\.0+)?\s*\)$/i.test(bg);
+
+      const bs = window.getComputedStyle(document.body);
+      const hs = document.documentElement ? window.getComputedStyle(document.documentElement) : null;
+      const rootApp = document.querySelector('ytd-app, #app, #root, #__next, main');
+      const rs = rootApp ? window.getComputedStyle(rootApp) : null;
+
+      let effectiveBg = bs.backgroundColor;
+      if (isTransparent(effectiveBg) && rs && !isTransparent(rs.backgroundColor)) {
+        effectiveBg = rs.backgroundColor;
+      } else if (isTransparent(effectiveBg) && hs && !isTransparent(hs.backgroundColor)) {
+        effectiveBg = hs.backgroundColor;
+      } else if (isTransparent(effectiveBg)) {
+        const prefersDark =
+          (hs?.colorScheme || '').includes('dark') && !(hs?.colorScheme || '').includes('light');
+        effectiveBg = prefersDark ? 'rgb(15, 15, 15)' : 'rgb(255, 255, 255)';
+      }
+
+      const rgbMatch = effectiveBg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
+      const bgLum = rgbMatch
+        ? (0.299 * Number(rgbMatch[1]) + 0.587 * Number(rgbMatch[2]) + 0.114 * Number(rgbMatch[3])) / 255
+        : 1;
+      const polarity = bgLum >= 0.52 ? 'LIGHT THEME' : 'DARK THEME';
+
+      const hdr = document.querySelector('header, ytd-masthead, [role="banner"], nav');
+      const hStyle = hdr ? window.getComputedStyle(hdr) : null;
+      const hdrRect = hdr ? hdr.getBoundingClientRect() : null;
+
+      const aside = document.querySelector('aside, ytd-guide-renderer, ytd-mini-guide-renderer, [role="navigation"][aria-label*="side" i], [class*="sidebar" i]');
+      const aStyle = aside ? window.getComputedStyle(aside) : null;
+      const asideRect = aside ? aside.getBoundingClientRect() : null;
+
+      const btn = document.querySelector(
+        'button[class*="primary" i], button[class*="cta" i], a[class*="btn" i], a[class*="cta" i], header button, button',
+      );
+      const bStyle = btn ? window.getComputedStyle(btn) : null;
+
+      const searchEl = document.querySelector('input[type="search"], input[name*="search" i], input[placeholder*="Search" i], input[aria-label*="Search" i]');
+      const sStyle = searchEl ? window.getComputedStyle(searchEl) : null;
+
+      const headerLinks = Array.from(document.querySelectorAll('header a, nav a, header button, ytd-masthead a, ytd-masthead button, [role="banner"] a, [role="banner"] button'))
+        .map((el) => clean(el.textContent || el.getAttribute('aria-label'), 36))
+        .filter((t, i, arr) => Boolean(t) && arr.indexOf(t) === i)
+        .slice(0, 14);
+
+      const sidebarItems = aside
+        ? Array.from(aside.querySelectorAll('a, [role="menuitem"], [role="tab"], tp-yt-paper-item'))
+            .map((el) => clean(el.textContent || el.getAttribute('aria-label'), 32))
+            .filter((t, i, arr) => Boolean(t) && arr.indexOf(t) === i)
+            .slice(0, 14)
+        : [];
+
+      const chips = Array.from(
+        document.querySelectorAll('yt-chip-cloud-chip-renderer, [role="tab"], [class*="chip" i], [class*="filter" i] button, [class*="pill" i]'),
+      )
+        .map((el) => clean(el.textContent, 28))
+        .filter((t, i, arr) => Boolean(t) && t.length <= 28 && arr.indexOf(t) === i)
+        .slice(0, 14);
+
+      const h1 = document.querySelector('h1');
+      const h1Style = h1 ? window.getComputedStyle(h1) : null;
+
+      const cards = Array.from(
+        document.querySelectorAll(
+          'ytd-rich-item-renderer, ytd-video-renderer, article, [data-testid*="card" i], [class*="video-card" i], [class*="product" i], [class*="card" i]',
+        ),
+      )
+        .slice(0, 14)
+        .map((card) => {
+          const tEl = card.querySelector('#video-title, h1, h2, h3, h4, [class*="title" i]');
+          const mEl = card.querySelector('#channel-name, #metadata-line, .author, .channel, [class*="subtitle" i], [class*="meta" i], [class*="price" i], small');
+          const t = clean(tEl?.textContent || tEl?.getAttribute('aria-label'), 72);
+          const m = clean(mEl?.textContent, 52);
+          return t ? (m && m !== t ? `${t} (${m})` : t) : '';
+        })
+        .filter((t, i, arr) => Boolean(t) && arr.indexOf(t) === i)
+        .slice(0, 10);
+
+      const gridEl = document.querySelector('#contents.ytd-rich-grid-renderer, main [class*="grid" i], section [class*="grid" i]');
+      const gStyle = gridEl ? window.getComputedStyle(gridEl) : null;
+
+      return [
+        `Theme Polarity: ${polarity} | Effective Computed Background: ${effectiveBg}`,
+        `Document Text Color: ${bs.color}`,
+        `Font Family: ${clean(bs.fontFamily, 110)} | Base Size: ${bs.fontSize}`,
+        h1 ? `H1 Text: "${clean(h1.textContent, 80)}" (${h1Style?.fontSize || ''}, weight ${h1Style?.fontWeight || ''})` : '',
+        hdr && hStyle
+          ? `Header/Top Bar: bg=${isTransparent(hStyle.backgroundColor) ? effectiveBg : hStyle.backgroundColor}, text=${hStyle.color}, height=${Math.round(hdrRect?.height || 0)}px, position=${hStyle.position}`
+          : '',
+        aside && aStyle && asideRect && asideRect.width > 20
+          ? `Left Sidebar/Rail: bg=${isTransparent(aStyle.backgroundColor) ? effectiveBg : aStyle.backgroundColor}, width=${Math.round(asideRect.width)}px, items=[${sidebarItems.join(' | ')}]`
+          : '',
+        headerLinks.length > 0 ? `Header Controls: ${headerLinks.join(' | ')}` : '',
+        searchEl
+          ? `Search Bar: placeholder="${clean(searchEl.getAttribute('placeholder') || searchEl.getAttribute('aria-label'), 48)}", bg=${sStyle?.backgroundColor || ''}, radius=${sStyle?.borderRadius || ''}`
+          : '',
+        chips.length > 0 ? `Filter Chips / Tabs: ${chips.join(' | ')}` : '',
+        bStyle
+          ? `Primary Button Style: bg=${bStyle.backgroundColor}, color=${bStyle.color}, radius=${bStyle.borderRadius}`
+          : '',
+        gStyle && gStyle.display.includes('grid')
+          ? `Main Grid Layout: columns=${clean(gStyle.gridTemplateColumns, 80)}, gap=${gStyle.gap}`
+          : '',
+        cards.length > 0 ? `Live Rendered Feed / Cards:\n- ${cards.join('\n- ')}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n');
+    })
+    .catch(() => '');
+}
+
+async function captureVisualReconForClone(options: {
+  targetUrl: string;
+  hostname: string;
+  mobileViewport: boolean;
+  validatedHostCache: Map<string, string[]>;
+}): Promise<{
+  partialHtml: string;
+  partialScreenshot: Buffer | null;
+  partialVisualHints: string;
+}> {
+  const { targetUrl, hostname, mobileViewport, validatedHostCache } = options;
+  let browser: Browser | null = null;
+  let context: BrowserContext | null = null;
+  const deadline = Date.now() + 9500;
+
+  try {
+    const execPath = resolveChromiumExecutablePath();
+    browser = await chromium.launch({
+      headless: true,
+      ...(execPath ? { executablePath: execPath } : { channel: 'chromium' }),
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-blink-features=AutomationControlled',
+      ],
+    });
+
+    const majorVersion = browser.version().split('.')[0] || '136';
+    context = await browser.newContext({
+      viewport: mobileViewport ? { width: 390, height: 844 } : { width: 1440, height: 900 },
+      isMobile: mobileViewport,
+      hasTouch: mobileViewport,
+      locale: 'en-US',
+      userAgent: mobileViewport
+        ? `Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${majorVersion}.0.0.0 Mobile Safari/537.36`
+        : `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${majorVersion}.0.0.0 Safari/537.36`,
+      extraHTTPHeaders: {
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+    });
+
+    // Pre-seed public preference/consent cookies so public homepages render instead of cookie interstitials
+    if (/youtube\.com|google\.com/i.test(hostname)) {
+      await context
+        .addCookies([
+          { name: 'CONSENT', value: 'YES+cb.20230531-07-p0.en+FX+999', domain: '.youtube.com', path: '/' },
+          { name: 'SOCS', value: 'CAESHAgBEhJnd3NfMjAyMzA4MTAtMF9SQzIaAmVuIAEaBgiA_LyaBg', domain: '.youtube.com', path: '/' },
+          { name: 'PREF', value: 'tz=America.Los_Angeles&hl=en', domain: '.youtube.com', path: '/' },
+        ])
+        .catch(() => {});
+    }
+
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
+
+    await context.route('**/*', async (route) => {
+      const req = route.request();
+      const reqUrl = req.url();
+      const rType = req.resourceType();
+      if (reqUrl.startsWith('data:') || reqUrl.startsWith('blob:') || reqUrl.startsWith('about:')) {
+        await route.continue();
+        return;
+      }
+      if (rType === 'media') {
+        await route.abort('blockedbyclient');
+        return;
+      }
+      try {
+        await validateExternalUrl(reqUrl, validatedHostCache);
+        await route.continue();
+      } catch {
+        await route.abort('blockedbyclient');
+      }
+    });
+
+    const page = await context.newPage();
+    await page.goto(targetUrl, {
+      waitUntil: 'domcontentloaded',
+      timeout: Math.max(3500, deadline - Date.now() - 2500),
+    });
+
+    const remaining = deadline - Date.now();
+    if (remaining > 900) {
+      await page
+        .waitForFunction(
+          () =>
+            (document.body?.innerText?.trim().length || 0) >= 80 ||
+            document.querySelectorAll('ytd-rich-item-renderer, article, main a').length >= 3,
+          undefined,
+          {
+            timeout: Math.min(2800, remaining - 500),
+          },
+        )
+        .catch(() => {});
+      await page.waitForTimeout(Math.min(800, Math.max(200, deadline - Date.now() - 400)));
+    }
+
+    // Attempt to dismiss cookie/consent dialogs cleanly before screenshot
+    await page
+      .evaluate(() => {
+        const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+        for (const b of btns) {
+          const txt = (b.textContent || b.getAttribute('aria-label') || '').trim();
+          if (/^(Reject all|Accept all|Accept cookies|I agree|Got it)$/i.test(txt)) {
+            (b as HTMLElement).click();
+            break;
+          }
+        }
+      })
+      .catch(() => {});
+
+    const title = await page.title().catch(() => '');
+    const bodyText = await page.evaluate(() => (document.body?.innerText || '').slice(0, 600)).catch(() => '');
+    if (/Just a moment\.\.\.|Attention Required! \| Cloudflare|Before you continue to (YouTube|Google)/i.test(`${title} ${bodyText}`)) {
+      return { partialHtml: '', partialScreenshot: null, partialVisualHints: '' };
+    }
+
+    const [html, shot, visualHints] = await Promise.all([
+      page.content().catch(() => ''),
+      page.screenshot({ type: 'png', fullPage: false }).catch(() => null),
+      extractVisualBlueprintFromPage(page),
+    ]);
+
+    return {
+      partialHtml: html && html.length > 150 ? html : '',
+      partialScreenshot: shot,
+      partialVisualHints: visualHints,
+    };
+  } catch {
+    return { partialHtml: '', partialScreenshot: null, partialVisualHints: '' };
+  } finally {
+    if (context) await context.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
   }
 }
 
@@ -371,12 +664,96 @@ export async function runCaptureJob(
 
     checkAborted();
 
+    const initialStrategy =
+      job.options.captureStrategy === 'clone' || job.options.captureStrategy === 'live'
+        ? job.options.captureStrategy
+        : 'auto';
+
+    // Fast-path known dynamic interactive web apps & explicit App Clone mode with quick visual recon
+    if (
+      initialStrategy === 'clone' ||
+      (initialStrategy === 'auto' && DYNAMIC_WEB_APP_HOST_RE.test(entryUrl.hostname))
+    ) {
+      const reason =
+        initialStrategy === 'clone'
+          ? `Interactive App Clone mode enabled for ${entryUrl.hostname}.`
+          : `Detected interactive web application (${entryUrl.hostname}); building a complete working client-side clone with sign-in, interactive controls, and navigation.`;
+      emit('capturing', `Capturing visual layout & design cues from ${entryUrl.hostname}...`, 24, reason);
+
+      const recon = await captureVisualReconForClone({
+        targetUrl: entryUrl.toString(),
+        hostname: entryUrl.hostname,
+        mobileViewport: job.options.mobileViewport,
+        validatedHostCache,
+      });
+
+      partialHtml = recon.partialHtml;
+      partialScreenshot = recon.partialScreenshot;
+      const reconVisualHints = recon.partialVisualHints;
+
+      if (!partialHtml) {
+        try {
+          const { response: hintRes } = await Promise.race([
+            safeFetchWithRedirectValidation(
+              entryUrl.toString(),
+              {
+                headers: {
+                  'User-Agent':
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
+                  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                  'Accept-Language': 'en-US,en;q=0.9',
+                },
+              },
+              4,
+              validatedHostCache,
+            ),
+            new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000)),
+          ]);
+          const ct = (hintRes.headers.get('content-type') || '').toLowerCase();
+          if (hintRes.ok && ct.includes('text/html')) {
+            const raw = await hintRes.text();
+            if (raw.length > 150 && !/Before you continue to (YouTube|Google)|Just a moment\.\.\./i.test(raw)) {
+              partialHtml = raw;
+            }
+          }
+        } catch {
+          // Proceed with visual screenshot / Google Search grounding
+        }
+      }
+
+      clearTimeout(jobTimer);
+      emit(
+        'capturing',
+        `Building accurate interactive clone for ${entryUrl.hostname}...`,
+        52,
+        reason,
+      );
+      await generateCloneFallbackForUrl({
+        targetUrl: job.url,
+        failureReason: reason,
+        partialHtml: partialHtml || undefined,
+        partialScreenshot,
+        partialVisualHints: reconVisualHints || undefined,
+        validatedHostCache,
+        job,
+        stats,
+      });
+      emit(
+        'ready',
+        'Website build complete. Preview your files or click Download ZIP when ready.',
+        100,
+        reason,
+      );
+      return;
+    }
+
     // 3. Launch Chromium in a fresh browser context
     emit('launching', 'Launching isolated Chromium browser context...', 18);
     try {
+      const execPath = resolveChromiumExecutablePath();
       browser = await chromium.launch({
         headless: true,
-        channel: 'chromium',
+        ...(execPath ? { executablePath: execPath } : { channel: 'chromium' }),
         args: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
@@ -641,12 +1018,6 @@ export async function runCaptureJob(
         if (!readyState || (readyState !== 'interactive' && readyState !== 'complete')) {
           if (pages.length === 0 && !mainResponse) {
             const rawMsg = err instanceof Error ? err.message : 'Navigation failed';
-            if (rawMsg.toLowerCase().includes('timeout')) {
-              throw new CaptureError(
-                'TIMEOUT',
-                `Page navigation timed out using the "${waitStrategy}" strategy (${Math.round(pageGotoTimeout / 1000)}s limit).`,
-              );
-            }
             if (rawMsg.includes('ERR_NAME_NOT_RESOLVED')) {
               throw new CaptureError(
                 'DNS_ERROR',
@@ -659,10 +1030,45 @@ export async function runCaptureJob(
                 `This looks like a private workspace preview URL (${currentParsed.hostname}) that cannot be fetched externally.`,
               );
             }
+
+            // Before throwing NETWORK_ERROR/TIMEOUT, probe via standard Node fetch for partialHtml hints
+            try {
+              const { response: probeRes } = await Promise.race([
+                safeFetchWithRedirectValidation(
+                  current.url,
+                  {
+                    headers: {
+                      'User-Agent':
+                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
+                      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    },
+                  },
+                  4,
+                  validatedHostCache,
+                ),
+                new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000)),
+              ]);
+              const probeCt = (probeRes.headers.get('content-type') || '').toLowerCase();
+              if (probeRes.ok && probeCt.includes('text/html')) {
+                const probeHtml = await probeRes.text();
+                if (probeHtml.trim().length > 150) {
+                  partialHtml = probeHtml;
+                }
+              }
+            } catch {
+              // Ignore probe error
+            }
+
+            if (rawMsg.toLowerCase().includes('timeout')) {
+              throw new CaptureError(
+                'TIMEOUT',
+                `Page navigation timed out using the "${waitStrategy}" strategy (${Math.round(pageGotoTimeout / 1000)}s limit).`,
+              );
+            }
             if (rawMsg.includes('net::ERR_')) {
               throw new CaptureError(
                 'NETWORK_ERROR',
-                `Network error loading "${current.url}": ${rawMsg.split('\n')[0]}`,
+                `Direct browser could not connect to "${current.url}" (${rawMsg.split('\n')[0]}).`,
               );
             }
             throw new CaptureError(
@@ -815,10 +1221,22 @@ export async function runCaptureJob(
         break;
       }
 
+      const captureStrategy =
+        job.options.captureStrategy === 'clone' || job.options.captureStrategy === 'live'
+          ? job.options.captureStrategy
+          : 'auto';
+
       if (pages.length === 0 && !isPrivateOrAuthHost(current.url) && isPrivateOrAuthHost(landedUrl)) {
+        const isWorkspacePreview = PRIVATE_PREVIEW_HOST_RE.test(new URL(landedUrl).hostname);
+        if (isWorkspacePreview || captureStrategy === 'live') {
+          throw new CaptureError(
+            'PRIVATE_SITE',
+            `Target site redirected to a login or authentication page (${new URL(landedUrl).hostname}). SiteGrab does not bypass authentication.`,
+          );
+        }
         throw new CaptureError(
-          'PRIVATE_SITE',
-          `Target site redirected to a login or authentication page (${new URL(landedUrl).hostname}). SiteGrab does not bypass authentication.`,
+          'DYNAMIC_APP_CLONE',
+          `Public site redirected to sign-in/consent gate (${new URL(landedUrl).hostname}); building a complete interactive clone instead.`,
         );
       }
 
@@ -922,7 +1340,7 @@ export async function runCaptureJob(
           .evaluate(() => {
             const txt = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
             const visualCount = document.querySelectorAll('img, svg, canvas, video').length;
-            return { len: txt.length, snippet: txt.slice(0, 600), visualCount };
+            return { len: txt.length, snippet: txt.slice(0, 800), visualCount };
           })
           .catch(() => ({ len: 0, snippet: '', visualCount: 0 }));
 
@@ -936,6 +1354,31 @@ export async function runCaptureJob(
             'ACCESS_DENIED',
             'Target website presented a browser verification challenge instead of page content.',
           );
+        }
+
+        if (captureStrategy === 'clone') {
+          partialHtml = html;
+          throw new CaptureError(
+            'DYNAMIC_APP_CLONE',
+            `Interactive App Clone mode enabled for ${currentParsed.hostname}.`,
+          );
+        }
+
+        if (captureStrategy === 'auto') {
+          const failedApiCount = failedResources.filter(
+            (r) => r.resourceType === 'fetch' || r.resourceType === 'xhr',
+          ).length;
+          const dynamicReason = isConsentOrDynamicAppShell(
+            finalPageUrl,
+            html,
+            title,
+            probe.snippet,
+            failedApiCount,
+          );
+          if (dynamicReason) {
+            partialHtml = html;
+            throw new CaptureError('DYNAMIC_APP_CLONE', dynamicReason);
+          }
         }
 
         if (probe.len < 25 && probe.visualCount < 2) {
@@ -1170,16 +1613,22 @@ export async function runCaptureJob(
                 err instanceof Error ? err.message : 'An unexpected error occurred during capture.',
               );
 
-    // Preserve any partially rendered HTML or screenshot from Playwright before closing browser
-    if (context && !partialHtml) {
+    // Preserve any partially rendered HTML, visual CSS styles, or screenshot from Playwright before closing browser
+    let partialVisualHints = '';
+    if (context) {
       try {
         const openPages = context.pages();
         if (openPages.length > 0) {
           const p = openPages[0];
-          const maybeHtml = await p.content().catch(() => '');
-          if (maybeHtml && maybeHtml.length > 150 && !/Just a moment\.\.\./i.test(maybeHtml)) {
-            partialHtml = maybeHtml;
-            partialScreenshot = await p.screenshot({ type: 'png' }).catch(() => null);
+          const maybeHtml = partialHtml || (await p.content().catch(() => ''));
+          if (maybeHtml && maybeHtml.length > 150 && !/Just a moment\.\.\.|Attention Required! \| Cloudflare/i.test(maybeHtml)) {
+            if (!partialHtml) {
+              partialHtml = maybeHtml;
+            }
+            if (!partialScreenshot) {
+              partialScreenshot = await p.screenshot({ type: 'png' }).catch(() => null);
+            }
+            partialVisualHints = await extractVisualBlueprintFromPage(p);
           }
         }
       } catch {
@@ -1207,10 +1656,14 @@ export async function runCaptureJob(
     ]);
 
     if (!NON_CLONABLE_CODES.has(captureErr.code)) {
+      // Disarm navigation timer so Playwright duration does not starve fallback generation
+      clearTimeout(jobTimer);
       try {
         emit(
           'capturing',
-          'Direct capture hit an error — building a complete interactive website clone...',
+          captureErr.code === 'DYNAMIC_APP_CLONE'
+            ? 'Building a complete working interactive web app clone...'
+            : 'Direct capture hit an error — building a complete interactive website clone...',
           68,
           captureErr.message,
         );
@@ -1219,6 +1672,7 @@ export async function runCaptureJob(
           failureReason: captureErr.message,
           partialHtml: partialHtml || undefined,
           partialScreenshot,
+          partialVisualHints: partialVisualHints || undefined,
           validatedHostCache,
           job,
           stats,
@@ -1230,8 +1684,18 @@ export async function runCaptureJob(
           captureErr.message,
         );
         return;
-      } catch {
-        // If fallback cloning also fails (e.g. missing API key), propagate original error cleanly
+      } catch (fallbackErr) {
+        console.error('Fallback website generation failed:', fallbackErr);
+        const fbCode =
+          fallbackErr && typeof fallbackErr === 'object' && 'code' in fallbackErr
+            ? String((fallbackErr as { code?: string }).code || '')
+            : '';
+        if (fbCode === 'AI_UNCONFIGURED') {
+          throw new CaptureError(
+            'CAPTURE_FAILED',
+            fallbackErr instanceof Error ? fallbackErr.message : 'AI fallback is not configured.',
+          );
+        }
       }
     }
 

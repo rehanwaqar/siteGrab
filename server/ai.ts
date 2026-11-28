@@ -1,6 +1,7 @@
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { GoogleGenAI, Type } from '@google/genai';
+import { isRetryableAiError, safeParseModelJson } from './jsonUtils.ts';
 import type { CaptureJob } from './types.ts';
 
 export interface AiFileEdit {
@@ -160,10 +161,10 @@ export async function runAiCodeAssistant(options: {
     'You are the SiteGrab AI Code Assistant helping a developer inspect, explain, style, make responsive, or fix frontend errors in a captured static website.',
     'Rules:',
     '1. Base every explanation and edit ONLY on the actual captured project files provided in the prompt. Never invent unrelated sample sites or fake files.',
-    '2. Static snapshots do NOT include server-side backends, authentication, or live databases. If the user asks about backend/database behavior, clearly explain that static capture only includes client-side HTML, CSS, and JS.',
+    '2. When the user asks to make interactive features work (such as Sign In / Sign Out, user profiles, video playback, shopping carts, comments, likes, subscriptions, posts, search, or filters), ALWAYS implement complete working client-side JavaScript functionality backed by structured state and localStorage persistence (our preview sandbox guarantees localStorage works cleanly without throwing).',
     '3. Keep relative local asset paths (./assets/...) intact whenever editing HTML or CSS.',
     '4. When mode is "explain", return an empty "edits" array and put a clear, structured technical explanation in "explanation".',
-    '5. When mode is "modify", provide complete, valid, working file contents in "updatedContent" for each modified file (only include files that actually change, using their exact relative paths from the project tree). Keep changes focused and preserve existing functionality.',
+    '5. When mode is "modify", provide complete, valid, working file contents in "updatedContent" for each modified file (only include files that actually change, using their exact relative paths from the project tree). Keep changes focused, preserve existing functionality, and ensure all added or modified buttons, icon controls, links, tabs, filters, modals, and forms are wired with working JavaScript (never leave dead buttons or unhooked controls).',
   ].join('\n');
 
   const userPrompt = [
@@ -226,25 +227,28 @@ export async function runAiCodeAssistant(options: {
     });
 
   try {
-    let response;
+    let parsed: Partial<AiAssistantResult> | null = null;
     try {
-      response = await callGenerate('gemini-4-hydrogen');
+      const response = await callGenerate('gemini-4-hydrogen');
+      parsed = safeParseModelJson<Partial<AiAssistantResult>>(response.text ?? '');
+      if (!parsed) {
+        throw new Error('EMPTY_OR_MALFORMED_PRIMARY');
+      }
     } catch (primaryErr) {
       const primaryMsg = primaryErr instanceof Error ? primaryErr.message : '';
-      if (primaryMsg.includes('503') || primaryMsg.includes('UNAVAILABLE')) {
-        await new Promise((r) => setTimeout(r, 500));
-        response = await callGenerate('gemini-3.1-flash-lite');
+      if (isRetryableAiError(primaryErr) || primaryMsg === 'EMPTY_OR_MALFORMED_PRIMARY') {
+        await new Promise((r) => setTimeout(r, 350));
+        const fallbackResponse = await callGenerate('gemini-3.1-flash-lite');
+        parsed = safeParseModelJson<Partial<AiAssistantResult>>(fallbackResponse.text ?? '');
       } else {
         throw primaryErr;
       }
     }
 
-    const rawText = (response.text ?? '').trim();
-    if (!rawText) {
-      throw new AiServiceError(502, 'AI assistant returned an empty response.');
+    if (!parsed) {
+      throw new AiServiceError(502, 'AI assistant returned an unreadable response. Please try again.');
     }
 
-    const parsed = JSON.parse(rawText) as Partial<AiAssistantResult>;
     const validEdits: AiFileEdit[] = [];
 
     if (mode === 'modify' && Array.isArray(parsed.edits)) {

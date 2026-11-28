@@ -1,5 +1,9 @@
 import path from 'node:path';
 import * as cheerio from 'cheerio';
+import {
+  ENHANCED_INTERACTION_JS,
+  SANDBOX_COMPAT_HEAD_SHIM,
+} from './generatedSiteRepair.ts';
 
 export function normalizeUrlKey(rawUrl: string): string {
   try {
@@ -149,6 +153,14 @@ export function rewriteHtmlDocument(options: {
   $('script[integrity], link[integrity]').removeAttr('integrity');
   $('img[loading="lazy"]').removeAttr('loading');
 
+  // Inject sandbox storage & history compatibility shim before any page scripts run
+  if ($('script[data-sitegrab-sandbox-shim]').length === 0) {
+    if ($('head').length === 0) {
+      $('html').prepend('<head></head>');
+    }
+    $('head').prepend(`\n    ${SANDBOX_COMPAT_HEAD_SHIM}`);
+  }
+
   const urlAttrs: Array<{ selector: string; attr: string; includePages?: boolean }> = [
     { selector: 'link[href]', attr: 'href' },
     { selector: 'script[src]', attr: 'src' },
@@ -277,11 +289,15 @@ export function rewriteHtmlDocument(options: {
     );
   }
 
-  // Graceful offline feedback for uncaptured links & forms without leaving broken 404 screens
-  if ($('script[data-sitegrab-offline-ui]').length === 0) {
-    $('body').append(
-      `<script data-sitegrab-offline-ui>(function(){var showToast=function(msg){var id='sitegrab-offline-toast';var old=document.getElementById(id);if(old)old.remove();var el=document.createElement('div');el.id=id;el.style.cssText='position:fixed;bottom:16px;right:16px;z-index:2147483647;background:#0f172a;color:#f8fafc;border:1px solid #334155;border-radius:10px;padding:10px 14px;font:12px/1.4 system-ui,sans-serif;box-shadow:0 10px 25px rgba(0,0,0,0.35);max-width:340px;';el.textContent=msg;document.body.appendChild(el);setTimeout(function(){if(el.parentNode)el.remove();},3500);};document.addEventListener('click',function(e){var a=e.target&&e.target.closest?e.target.closest('a[data-sitegrab-uncaptured]'):null;if(!a)return;e.preventDefault();var raw=a.getAttribute('data-sitegrab-uncaptured')||'';showToast('Offline preview: external page not included in single-page capture ('+raw+'). Increase Crawl Depth to capture subpages.');});document.addEventListener('submit',function(e){var form=e.target;if(!form||form.tagName!=='FORM')return;var action=(form.getAttribute('action')||'').trim();if(action&&!action.startsWith('#')){e.preventDefault();showToast('Form submission previewed locally (no live backend in static snapshot).');}});})();</script>`,
-    );
+  // Interactive client-side runtime so Sign In, Cart, Media Player, Filters, Forms, and Nav links work cleanly offline
+  if ($('script[data-sitegrab-interactive-runtime]').length === 0) {
+    const safeRuntimeJs = ENHANCED_INTERACTION_JS.replace(/<\/script>/gi, '<\\/script>');
+    const runtimeTag = `\n    <script data-sitegrab-interactive-runtime>${safeRuntimeJs}</script>`;
+    if ($('body').length > 0) {
+      $('body').append(runtimeTag);
+    } else {
+      $('html').append(runtimeTag);
+    }
   }
 
   return { html: $.html(), unresolvedLinks };

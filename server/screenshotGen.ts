@@ -4,6 +4,7 @@ import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import * as cheerio from 'cheerio';
 import { formatCapturedCode } from './formatter.ts';
 import { normalizeAndRepairGeneratedFiles } from './generatedSiteRepair.ts';
+import { isRetryableAiError, safeParseModelJson } from './jsonUtils.ts';
 import type { CaptureJob, CaptureStats } from './types.ts';
 import {
   createZipArchive,
@@ -132,18 +133,23 @@ export async function generateWebsiteFromScreenshot(options: {
   const ai = getGeminiClient();
 
   const systemInstruction = [
-    'You are an expert frontend engineer converting a website/UI screenshot into a complete, pixel-faithful, responsive, WORKING interactive static website project.',
-    'Requirements:',
-    '1. Generate clean, semantic HTML5, modern CSS3, and real working vanilla JavaScript — NEVER leave placeholder stubs, "coming soon" sections, or dead buttons.',
-    '2. Recreate the exact visual hierarchy, color palette, typography scale, spacing, header/navigation, hero, cards/grids, tables/forms, buttons, badges, and footer visible in the screenshot.',
-    '3. Split files cleanly: always provide "index.html", "css/styles.css", and "js/main.js" powering interactive tabs, filters, search, modals, mobile menu toggles, calculators, or forms with live DOM feedback.',
-    '4. Reference local assets strictly with relative paths ("./css/styles.css", "./js/main.js", "./assets/images/...").',
-    '5. Do NOT use external image URLs or CDN links that might break offline. Instead, use crisp inline SVGs, CSS gradients, or local "./assets/images/*.svg" files for icons, illustrations, avatars, and product thumbnails.',
-    '6. Keep all text readable and responsive across desktop, tablet, and mobile viewports.',
+    'You are a principal frontend engineer converting a website/UI screenshot into a PIXEL-FAITHFUL, ACCURATE, RESPONSIVE, FULLY FUNCTIONAL web application project.',
+    'VISUAL & CONTENT ACCURACY RULES:',
+    '1. Transcribe EVERY visible section, brand logo/title, header or sidebar navigation item, hero headline/copy, KPI/metric numbers, table columns/rows, card titles/prices/descriptions, status badges, search/filter bars, inputs, footer columns, and action buttons faithfully from the screenshot.',
+    '2. Match the EXACT visual theme (light vs dark background), background/surface/border/text/accent hex colors in :root CSS custom properties, typography hierarchy, card grid proportions, border radii, shadows, and alignment shown in the screenshot.',
+    '3. Where charts, illustrations, avatars, or product visuals appear in the screenshot, render crisp matching local SVGs in "./assets/images/*.svg" or inline SVGs — NEVER use external image URLs or CDN links.',
+    'COMPLETE WORKING APPLICATION MECHANICS (UNIFIED SPA + ZERO DEAD BUTTONS):',
+    '4. Build interactive web apps as a UNIFIED SINGLE-PAGE APPLICATION inside "index.html" + "css/styles.css" + "js/main.js" using `data-view` / `#hash` view-switching so state, playback, cart, and Sign In session persist cleanly without resets. NEVER leave decorative or dead buttons, placeholder stubs, or "coming soon" sections. Audit EVERY visible control and wire it in "js/main.js" with "localStorage" persistence:',
+    '   - Header & chrome buttons: Hamburger menu/sidebar toggle, search submit + clear, Create/Upload/New modal, Notifications bell popover, Theme toggle, and Sign In / Account modal (1-click Demo Sign In + email/name form) that updates the header to an interactive User Avatar + Account Dropdown + Sign Out.',
+    '   - Video / Media / Store / Social / Dashboard cards & CTAs: clicking cards opens genuine interactive views/drawers/modals (e.g., playable <canvas> video player with Play/Pause/Seek/Like/Subscribe/Comments for video sites; Shopping Cart drawer with qty/promo/checkout for stores; Post Composer/Replies for social; Live CRUD/KPI filters for dashboards).',
+    '   - Tabs, category/status filter pills, search inputs, sort dropdowns, billing switches, FAQ accordions, and counters: genuinely filter, sort, switch, or update visible items.',
+    '   - Forms & inputs: validate required fields and display real inline confirmation/status feedback.',
+    '5. Split files cleanly: always output "index.html", "css/styles.css", "js/main.js", optional linked "pages/<slug>.html", and compact local "./assets/images/*.svg" assets.',
   ].join('\n');
 
   const promptText = [
-    'Convert this website screenshot into a complete, ready-to-run static website project matching the layout and visual style as closely as possible.',
+    'Convert this website screenshot into an accurate, faithful, ready-to-run working web application matching every visible section, color palette, typography scale, text label, card, table, input, and button.',
+    'Use a unified SPA structure (`data-view` panels in index.html + complete `js/main.js`) so EVERY single button, icon button, sidebar/nav link, Sign In flow, media/item card, tab, search input, filter pill, dropdown, toggle, and form works interactively with localStorage persistence.',
     notes && notes.trim() ? `Additional user instructions: ${notes.trim()}` : '',
   ]
     .filter(Boolean)
@@ -156,7 +162,7 @@ export async function generateWebsiteFromScreenshot(options: {
     },
   };
 
-  const callVisionGenerate = async (modelName: string, useMediumThinking: boolean) =>
+  const callVisionGenerate = async (modelName: string, useHighThinking: boolean) =>
     ai.models.generateContent({
       model: modelName,
       contents: {
@@ -164,18 +170,18 @@ export async function generateWebsiteFromScreenshot(options: {
       },
       config: {
         systemInstruction,
-        ...(useMediumThinking ? { thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM } } : {}),
+        ...(useHighThinking ? { thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH } } : {}),
         responseMimeType: 'application/json',
         responseSchema: {
           type: Type.OBJECT,
           properties: {
             siteTitle: {
               type: Type.STRING,
-              description: 'Short descriptive title for the generated website.',
+              description: 'Exact brand or page title shown in the screenshot.',
             },
             summary: {
               type: Type.STRING,
-              description: 'Brief summary of the generated layout and files.',
+              description: 'Brief summary of the faithful layout and working interactive features.',
             },
             files: {
               type: Type.ARRAY,
@@ -185,7 +191,7 @@ export async function generateWebsiteFromScreenshot(options: {
                 properties: {
                   filePath: {
                     type: Type.STRING,
-                    description: 'Relative path inside project (e.g. index.html, css/styles.css, js/main.js, assets/images/hero.svg).',
+                    description: 'Relative path inside project (e.g. index.html, css/styles.css, js/main.js, pages/<slug>.html, assets/images/hero.svg).',
                   },
                   content: {
                     type: Type.STRING,
@@ -201,15 +207,21 @@ export async function generateWebsiteFromScreenshot(options: {
       },
     });
 
-  let response;
+  let parsed: Partial<GeneratedSitePayload> | null = null;
   try {
+    let response;
     try {
       response = await callVisionGenerate('gemini-4-hydrogen', true);
+      parsed = safeParseModelJson<Partial<GeneratedSitePayload>>(response.text ?? '');
+      if (!parsed || !Array.isArray(parsed.files) || parsed.files.length === 0) {
+        throw new Error('EMPTY_OR_MALFORMED_PRIMARY');
+      }
     } catch (primaryErr) {
       const msg = primaryErr instanceof Error ? primaryErr.message : '';
-      if (msg.includes('503') || msg.includes('UNAVAILABLE')) {
-        await new Promise((r) => setTimeout(r, 500));
+      if (isRetryableAiError(primaryErr) || msg === 'EMPTY_OR_MALFORMED_PRIMARY') {
+        await new Promise((r) => setTimeout(r, 350));
         response = await callVisionGenerate('gemini-3.1-flash-lite', false);
+        parsed = safeParseModelJson<Partial<GeneratedSitePayload>>(response.text ?? '');
       } else {
         throw primaryErr;
       }
@@ -245,19 +257,7 @@ export async function generateWebsiteFromScreenshot(options: {
     );
   }
 
-  const rawText = (response.text ?? '').trim();
-  if (!rawText) {
-    throw new ScreenshotGenError(
-      502,
-      'CAPTURE_FAILED',
-      'Website generator returned an empty response. Please try again.',
-    );
-  }
-
-  let parsed: Partial<GeneratedSitePayload>;
-  try {
-    parsed = JSON.parse(rawText) as Partial<GeneratedSitePayload>;
-  } catch {
+  if (!parsed) {
     throw new ScreenshotGenError(
       502,
       'CAPTURE_FAILED',

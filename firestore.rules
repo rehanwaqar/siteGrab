@@ -232,7 +232,8 @@ service cloud.firestore {
           isValidId(snapshotId) &&
           isOwner(userId) &&
           isVerifiedUser() &&
-          existing().ownerUid == request.auth.uid &&
+          (resource == null || existing().ownerUid == request.auth.uid) &&
+          exists(/databases/$(database)/documents/users/$(userId)) &&
           get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
 
         allow list: if isOwner(userId) &&
@@ -244,6 +245,7 @@ service cloud.firestore {
           isOwner(userId) &&
           isVerifiedUser() &&
           isValidUserSnapshot(incoming(), userId, snapshotId) &&
+          exists(/databases/$(database)/documents/users/$(userId)) &&
           get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
 
         allow update: if false;
@@ -252,7 +254,7 @@ service cloud.firestore {
           isValidId(snapshotId) &&
           isOwner(userId) &&
           isVerifiedUser() &&
-          existing().ownerUid == request.auth.uid;
+          (resource == null || existing().ownerUid == request.auth.uid);
 
         match /bundles/{bundleId} {
           allow get: if isValidId(userId) &&
@@ -260,7 +262,8 @@ service cloud.firestore {
             isValidId(bundleId) &&
             isOwner(userId) &&
             isVerifiedUser() &&
-            existing().ownerUid == request.auth.uid &&
+            (resource == null || existing().ownerUid == request.auth.uid) &&
+            exists(/databases/$(database)/documents/users/$(userId)/snapshots/$(snapshotId)) &&
             get(/databases/$(database)/documents/users/$(userId)/snapshots/$(snapshotId)).data.ownerUid == request.auth.uid;
 
           allow list: if false;
@@ -273,6 +276,7 @@ service cloud.firestore {
             isValidSnapshotPreviewBundle(incoming(), userId, snapshotId) &&
             incoming().createdAt == request.time &&
             incoming().updatedAt == request.time &&
+            exists(/databases/$(database)/documents/users/$(userId)/snapshots/$(snapshotId)) &&
             get(/databases/$(database)/documents/users/$(userId)/snapshots/$(snapshotId)).data.ownerUid == request.auth.uid;
 
           allow update: if isValidId(userId) &&
@@ -292,7 +296,7 @@ service cloud.firestore {
             isValidId(bundleId) &&
             isOwner(userId) &&
             isVerifiedUser() &&
-            existing().ownerUid == request.auth.uid;
+            (resource == null || existing().ownerUid == request.auth.uid);
         }
       }
     }

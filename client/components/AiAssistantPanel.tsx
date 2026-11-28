@@ -1,12 +1,16 @@
 import { useState, type FormEvent } from 'react';
 import { Check, Code2, Loader2, Send, Wrench } from 'lucide-react';
-import { getAuthHeaders } from '../firebase';
 import type {
   AiAssistantResult,
   AiFileEdit,
   CapturedFileEntry,
   CaptureStats,
 } from '../types';
+import {
+  extractHttpErrorMessage,
+  fetchWithResilience,
+  readJsonSafe,
+} from '../utils/http';
 
 interface AiAssistantPanelProps {
   jobId: string;
@@ -84,33 +88,34 @@ export function AiAssistantPanel({ jobId, files, onEditsApplied }: AiAssistantPa
     setIsLoading(true);
 
     try {
-      const authHeaders = await getAuthHeaders();
-      const res = await fetch(`/api/capture/${encodeURIComponent(jobId)}/ai`, {
+      const res = await fetchWithResilience(`/api/capture/${encodeURIComponent(jobId)}/ai`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           prompt: trimmed,
           mode: activeMode,
           selectedFile: selectedFile || undefined,
           history: nextHistory.slice(-6).map((t) => ({ role: t.role, text: t.text })),
         }),
+        useAuth: true,
+        retries: 1,
       });
 
-      const data = (await res.json()) as Partial<AiAssistantResult> & { error?: string };
+      const data = await readJsonSafe<Partial<AiAssistantResult> & { error?: string }>(res);
       if (!res.ok) {
-        setErrorMsg(data.error || `AI request failed (HTTP ${res.status}).`);
+        setErrorMsg(extractHttpErrorMessage(res, data, 'AI request failed'));
         return;
       }
 
       const modelTurn: ChatTurn = {
         id: `m-${Date.now()}`,
         role: 'model',
-        text: data.explanation || 'Analysis complete.',
-        edits: Array.isArray(data.edits) ? data.edits : [],
+        text: data?.explanation || 'Analysis complete.',
+        edits: Array.isArray(data?.edits) ? data.edits : [],
       };
       setTurns((prev) => [...prev, modelTurn]);
     } catch {
-      setErrorMsg('Network error communicating with AI assistant.');
+      setErrorMsg('Connection interrupted communicating with AI assistant. Please try again.');
     } finally {
       setIsLoading(false);
     }
@@ -126,20 +131,21 @@ export function AiAssistantPanel({ jobId, files, onEditsApplied }: AiAssistantPa
     setIsApplyingId(turnId);
     setErrorMsg(null);
     try {
-      const authHeaders = await getAuthHeaders();
-      const res = await fetch(`/api/capture/${encodeURIComponent(jobId)}/apply-edits`, {
+      const res = await fetchWithResilience(`/api/capture/${encodeURIComponent(jobId)}/apply-edits`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ edits }),
+        useAuth: true,
+        retries: 1,
       });
-      const data = (await res.json()) as {
+      const data = await readJsonSafe<{
         appliedFiles?: string[];
         files?: CapturedFileEntry[];
         stats?: CaptureStats;
         error?: string;
-      };
-      if (!res.ok || !data.files || !data.stats) {
-        setErrorMsg(data.error || 'Could not apply changes to captured files.');
+      }>(res);
+      if (!res.ok || !data?.files || !data?.stats) {
+        setErrorMsg(extractHttpErrorMessage(res, data, 'Could not apply changes to captured files'));
         return;
       }
 
@@ -152,7 +158,7 @@ export function AiAssistantPanel({ jobId, files, onEditsApplied }: AiAssistantPa
         appliedFiles: data.appliedFiles || [],
       });
     } catch {
-      setErrorMsg('Failed to apply edits to server workspace.');
+      setErrorMsg('Failed to apply edits to server workspace. Please try again.');
     } finally {
       setIsApplyingId(null);
     }

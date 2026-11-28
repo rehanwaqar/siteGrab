@@ -4,7 +4,7 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import express, { type Express, type NextFunction, type Request, type Response } from 'express';
-import { chromium } from 'playwright';
+import { resolveChromiumExecutablePath } from './playwrightExec.ts';
 import {
   AiServiceError,
   isEditableTextFile,
@@ -28,6 +28,7 @@ import {
   getFeedbackSummary,
 } from './feedback.ts';
 import { formatCapturedCode } from './formatter.ts';
+import { ENHANCED_INTERACTION_JS, SANDBOX_COMPAT_HEAD_SHIM } from './generatedSiteRepair.ts';
 import { IpRateLimiter } from './rateLimit.ts';
 import { normalizeAndParseUrl, SsrfValidationError, validateExternalUrl } from './ssrf.ts';
 import type {
@@ -35,6 +36,7 @@ import type {
   CaptureOptions,
   CaptureStage,
   CaptureStats,
+  CaptureStrategy,
   ProgressEvent,
   WaitStrategy,
 } from './types.ts';
@@ -86,10 +88,10 @@ export function createSiteGrabServer(): Express {
   app.use(express.json({ limit: '1mb' }));
 
   const jobs = new Map<string, CaptureJob>();
-  const rateLimiter = new IpRateLimiter(5, 10 * 60 * 1000);
-  const zipImportLimiter = new IpRateLimiter(10, 10 * 60 * 1000);
-  const screenshotLimiter = new IpRateLimiter(8, 10 * 60 * 1000);
-  const feedbackLimiter = new IpRateLimiter(10, 10 * 60 * 1000);
+  const rateLimiter = new IpRateLimiter(20, 10 * 60 * 1000);
+  const zipImportLimiter = new IpRateLimiter(25, 10 * 60 * 1000);
+  const screenshotLimiter = new IpRateLimiter(20, 10 * 60 * 1000);
+  const feedbackLimiter = new IpRateLimiter(15, 10 * 60 * 1000);
 
   async function cleanupJobFiles(job: CaptureJob): Promise<void> {
     if (job.cleaned) return;
@@ -215,13 +217,7 @@ export function createSiteGrabServer(): Express {
   sweepTimer.unref();
 
   app.get('/api/health', (_req: Request, res: Response) => {
-    let chromiumInstalled = false;
-    try {
-      const execPath = chromium.executablePath();
-      chromiumInstalled = Boolean(execPath && fs.existsSync(execPath));
-    } catch {
-      chromiumInstalled = false;
-    }
+    const chromiumInstalled = Boolean(resolveChromiumExecutablePath());
     res.json({
       ok: true,
       service: 'sitegrab',
@@ -294,7 +290,7 @@ export function createSiteGrabServer(): Express {
       res.setHeader('Retry-After', String(limitResult.retryAfterSeconds));
       res.status(429).json({
         errorCode: 'RATE_LIMITED',
-        error: `Rate limit reached (5 captures per 10 minutes). Please wait ${limitResult.retryAfterSeconds} seconds and try again.`,
+        error: `Rate limit reached (20 captures per 10 minutes). Please wait ${limitResult.retryAfterSeconds} seconds and try again.`,
         retryAfterSeconds: limitResult.retryAfterSeconds,
       });
       return;
@@ -326,6 +322,10 @@ export function createSiteGrabServer(): Express {
       ? Math.max(15_000, Math.min(120_000, requestedTimeout))
       : 60_000;
 
+    const rawStrategy = body?.captureStrategy;
+    const captureStrategy: CaptureStrategy =
+      rawStrategy === 'clone' || rawStrategy === 'live' ? rawStrategy : 'auto';
+
     const options: CaptureOptions = {
       url: parsedUrl.toString(),
       crawlDepth: Math.max(0, Math.min(3, Number(body?.crawlDepth ?? 0) || 0)),
@@ -338,6 +338,7 @@ export function createSiteGrabServer(): Express {
       mobileViewport: body?.mobileViewport === true,
       saveScreenshots: body?.saveScreenshots === true,
       preserveInternalNav: body?.preserveInternalNav !== false,
+      captureStrategy,
       timeoutMs,
       waitStrategy,
     };
@@ -581,6 +582,7 @@ export function createSiteGrabServer(): Express {
           files: job.files,
           diagnostics: job.diagnostics,
           hasOriginalScreenshot: false,
+          captureMode: job.captureMode,
         };
         jobs.set(jobId, job);
         await saveJobMetaToDisk(job);
@@ -734,6 +736,7 @@ export function createSiteGrabServer(): Express {
           files: job.files,
           diagnostics: job.diagnostics,
           hasOriginalScreenshot: job.hasOriginalScreenshot,
+          captureMode: job.captureMode,
         };
         jobs.set(jobId, job);
         await saveJobMetaToDisk(job);
@@ -760,34 +763,72 @@ export function createSiteGrabServer(): Express {
     },
   );
 
-  app.get('/api/capture/:jobId/events', requireAuth, (req: Request, res: Response) => {
-    const job = jobs.get(String(req.params.jobId));
+  app.get('/api/capture/:jobId/events', requireAuth, async (req: Request, res: Response) => {
+    const job = await loadOrGetJob(String(req.params.jobId));
     if (!job || job.ownerUid !== req.authUser!.uid) {
       res.status(404).json({ error: 'Capture job not found or expired.' });
       return;
     }
 
-    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders?.();
 
-    const sendEvent = (evt: ProgressEvent) => {
-      res.write(`data: ${JSON.stringify(evt)}\n\n`);
-      if (evt.stage === 'ready' || evt.stage === 'error') {
-        res.end();
+    let closed = false;
+    let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+    const cleanup = () => {
+      if (closed) return;
+      closed = true;
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+      job.subscribers.delete(sendEvent);
+    };
+
+    const safeWrite = (chunk: string): boolean => {
+      if (closed || res.writableEnded || res.destroyed) return false;
+      try {
+        res.write(chunk);
+        return true;
+      } catch {
+        cleanup();
+        return false;
       }
     };
 
+    const sendEvent = (evt: ProgressEvent) => {
+      if (!safeWrite(`data: ${JSON.stringify(evt)}\n\n`)) {
+        return;
+      }
+      if (evt.stage === 'ready' || evt.stage === 'error') {
+        cleanup();
+        if (!res.writableEnded) {
+          res.end();
+        }
+      }
+    };
+
+    // Initial SSE comment flushes headers through proxies immediately
+    safeWrite(': connected\n\n');
     sendEvent(job.lastEvent);
     if (job.status === 'ready' || job.status === 'error') {
       return;
     }
 
     job.subscribers.add(sendEvent);
-    req.on('close', () => {
-      job.subscribers.delete(sendEvent);
-    });
+    heartbeatTimer = setInterval(() => {
+      if (!safeWrite(': keepalive\n\n')) {
+        cleanup();
+      }
+    }, 8000);
+    heartbeatTimer.unref?.();
+
+    req.on('close', cleanup);
+    res.on('error', cleanup);
   });
 
   app.get('/api/capture/:jobId/status', requireAuth, async (req: Request, res: Response) => {
@@ -1212,9 +1253,32 @@ export function createSiteGrabServer(): Express {
 
         const dest = resolveSafeSiteFile(job.siteDir, cleanRel);
         let contentToWrite = rawEdit.updatedContent;
+        const ext = path.posix.extname(cleanRel).toLowerCase();
+
+        if (ext === '.html' || ext === '.htm') {
+          if (!contentToWrite.includes('data-sitegrab-sandbox-shim')) {
+            if (/<head[^>]*>/i.test(contentToWrite)) {
+              contentToWrite = contentToWrite.replace(/<head[^>]*>/i, (m) => `${m}\n    ${SANDBOX_COMPAT_HEAD_SHIM}`);
+            } else {
+              contentToWrite = `${SANDBOX_COMPAT_HEAD_SHIM}\n${contentToWrite}`;
+            }
+          }
+          const hasRuntimeFile = await fsp
+            .stat(path.join(job.siteDir, 'js', 'sg-runtime.js'))
+            .then(() => true)
+            .catch(() => false);
+          if (hasRuntimeFile && !contentToWrite.includes('sg-runtime.js')) {
+            const relPrefix = cleanRel.startsWith('pages/') ? '../' : './';
+            const runtimeTag = `\n    <script src="${relPrefix}js/sg-runtime.js"></script>`;
+            if (/<\/body>/i.test(contentToWrite)) {
+              contentToWrite = contentToWrite.replace(/<\/body>/i, `${runtimeTag}\n  </body>`);
+            } else {
+              contentToWrite += runtimeTag;
+            }
+          }
+        }
 
         if (job.options.formatCode) {
-          const ext = path.posix.extname(cleanRel).toLowerCase();
           if (ext === '.html' || ext === '.htm') {
             contentToWrite = await formatCapturedCode(contentToWrite, 'html');
           } else if (ext === '.css') {
@@ -1266,8 +1330,23 @@ export function createSiteGrabServer(): Express {
     req: Request,
     res: Response,
   ): Promise<void> {
-    const cleanRel = relRequested.replace(/^\/+/, '') || 'index.html';
+    let cleanRel = relRequested.replace(/^\/+/, '') || 'index.html';
     const baseDir = path.resolve(job.siteDir);
+
+    // Always serve the latest interactive runtime enhancer for sg-runtime.js so restored history previews also benefit
+    if (cleanRel === 'js/sg-runtime.js') {
+      res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('Referrer-Policy', 'no-referrer');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      if (req.method === 'HEAD') {
+        res.status(200).end();
+        return;
+      }
+      res.send(ENHANCED_INTERACTION_JS);
+      return;
+    }
+
     let targetPath = path.resolve(baseDir, cleanRel);
 
     if (targetPath !== baseDir && !targetPath.startsWith(baseDir + path.sep)) {
@@ -1275,28 +1354,114 @@ export function createSiteGrabServer(): Express {
       return;
     }
 
-    try {
-      const stat = await fsp.stat(targetPath);
-      if (stat.isDirectory()) {
-        targetPath = path.resolve(targetPath, 'index.html');
-        if (!targetPath.startsWith(baseDir + path.sep)) {
-          res.status(403).send('Forbidden');
-          return;
+    const resolveTargetFile = async (candidate: string): Promise<{ fullPath: string; rel: string } | null> => {
+      try {
+        const st = await fsp.stat(candidate);
+        if (st.isDirectory()) {
+          const idx = path.resolve(candidate, 'index.html');
+          if (!idx.startsWith(baseDir + path.sep)) return null;
+          await fsp.stat(idx);
+          return { fullPath: idx, rel: path.posix.join(cleanRel, 'index.html') };
         }
+        return { fullPath: candidate, rel: cleanRel };
+      } catch {
+        // Resolve extensionless HTML routes (e.g. /about -> about.html or pages/about.html) or SPA fallback
+        if (!path.extname(cleanRel)) {
+          const variants = [`${cleanRel}.html`, `pages/${cleanRel}.html`, `${cleanRel}/index.html`];
+          for (const v of variants) {
+            const vp = path.resolve(baseDir, v);
+            if (!vp.startsWith(baseDir + path.sep)) continue;
+            try {
+              const vst = await fsp.stat(vp);
+              if (vst.isFile()) return { fullPath: vp, rel: v };
+            } catch {
+              // continue
+            }
+          }
+          const spaIdx = path.resolve(baseDir, 'index.html');
+          try {
+            const ist = await fsp.stat(spaIdx);
+            if (ist.isFile()) return { fullPath: spaIdx, rel: 'index.html' };
+          } catch {
+            // no index.html
+          }
+        }
+        return null;
       }
+    };
 
+    const resolved = await resolveTargetFile(targetPath);
+    if (!resolved) {
+      res.status(404).send('File not found in captured archive.');
+      return;
+    }
+
+    targetPath = resolved.fullPath;
+    cleanRel = resolved.rel;
+
+    try {
       const ext = path.extname(targetPath).toLowerCase();
       res.setHeader('Content-Type', MIME_MAP[ext] || 'application/octet-stream');
       res.setHeader('Cache-Control', 'no-store');
       res.setHeader('Referrer-Policy', 'no-referrer');
       res.setHeader('Access-Control-Allow-Origin', '*');
-      const hostHeader = req.get('x-forwarded-host') || req.get('host');
-      const protoHeader = (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
-      const originSource = hostHeader ? `${protoHeader}://${hostHeader} http://${hostHeader}` : '';
+
+      const rawHost = (req.get('x-forwarded-host') || req.get('host') || '').split(',')[0].trim();
+      const rawProto = (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
+      const validHost = /^[a-zA-Z0-9.:-]+$/.test(rawHost) ? rawHost : '';
+      const originSource = validHost ? `${rawProto}://${validHost} https://${validHost} http://${validHost}` : '';
+
+      // Opaque sandboxed iframes (allow-scripts allow-forms) cannot match 'self'; allow explicit preview host + https assets cleanly
       res.setHeader(
         'Content-Security-Policy',
-        `default-src 'self' ${originSource} data: blob: 'unsafe-inline' 'unsafe-eval'; img-src * data: blob:; font-src 'self' ${originSource} data: blob:; connect-src 'none';`,
+        `default-src ${originSource} 'self' https: data: blob: 'unsafe-inline' 'unsafe-eval'; script-src ${originSource} 'self' https: 'unsafe-inline' 'unsafe-eval' data: blob:; style-src * 'unsafe-inline' data: blob:; img-src * data: blob:; font-src * data: blob:; media-src * data: blob:; connect-src ${originSource} 'self' https: http: data: blob:;`,
       );
+
+      if (req.method === 'HEAD') {
+        res.status(200).end();
+        return;
+      }
+
+      if (ext === '.html' || ext === '.htm') {
+        let html = await fsp.readFile(targetPath, 'utf8');
+        // Strip restrictive meta CSP from captured HTML so preview scripts/styles execute cleanly
+        html = html.replace(/<meta[^>]+http-equiv=["']?Content-Security-Policy["']?[^>]*>/gi, '');
+
+        // Convert stray root-relative asset/page paths (/css/..., /js/..., /assets/...) into archive-relative paths
+        const depthSegments = Math.max(0, cleanRel.split('/').length - 1);
+        const relRootPrefix = depthSegments === 0 ? './' : '../'.repeat(depthSegments);
+        html = html.replace(
+          /(\s(?:src|href|poster)=["'])\/(?!\/|api\/)([^"']+)(["'])/gi,
+          `$1${relRootPrefix}$2$3`,
+        );
+
+        // Ensure latest sandbox compatibility shim runs before any page script
+        if (/<script[^>]+data-sitegrab-sandbox-shim[^>]*>[\s\S]*?<\/script>/i.test(html)) {
+          html = html.replace(
+            /<script[^>]+data-sitegrab-sandbox-shim[^>]*>[\s\S]*?<\/script>/i,
+            SANDBOX_COMPAT_HEAD_SHIM,
+          );
+        } else if (/<head[^>]*>/i.test(html)) {
+          html = html.replace(/<head[^>]*>/i, (m) => `${m}\n    ${SANDBOX_COMPAT_HEAD_SHIM}`);
+        } else {
+          html = `${SANDBOX_COMPAT_HEAD_SHIM}\n${html}`;
+        }
+
+        // Ensure interactive runtime is present even on imported ZIPs or older restored snapshots
+        if (!html.includes('sg-runtime.js') && !html.includes('data-sitegrab-interactive-runtime')) {
+          const safeRuntime = ENHANCED_INTERACTION_JS.replace(/<\/script>/gi, '<\\/script>');
+          const tag = `\n    <script data-sitegrab-interactive-runtime>${safeRuntime}</script>`;
+          if (/<\/body>/i.test(html)) {
+            html = html.replace(/<\/body>/i, `${tag}\n  </body>`);
+          } else {
+            html += tag;
+          }
+        }
+
+        res.send(html);
+        return;
+      }
+
       fs.createReadStream(targetPath).pipe(res);
     } catch {
       res.status(404).send('File not found in captured archive.');

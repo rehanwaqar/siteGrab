@@ -109,13 +109,17 @@ async function testConnection(): Promise<void> {
 }
 void testConnection();
 
-export async function getAuthHeaders(): Promise<Record<string, string>> {
+export async function getAuthHeaders(forceRefresh = false): Promise<Record<string, string>> {
   const user = auth.currentUser;
   if (!user) return {};
-  const token = await user.getIdToken();
-  return {
-    Authorization: `Bearer ${token}`,
-  };
+  try {
+    const token = await user.getIdToken(forceRefresh);
+    return {
+      Authorization: `Bearer ${token}`,
+    };
+  } catch {
+    return {};
+  }
 }
 
 export async function syncPreviewSessionCookie(): Promise<void> {
@@ -467,9 +471,15 @@ export async function saveUserSnapshotBundle(
       ? bundle.captureMode
       : 'live';
 
+  let existingSnap;
   try {
-    const existing = await getDoc(bundleRef);
-    if (!existing.exists()) {
+    existingSnap = await getDoc(bundleRef);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.GET, bundlePath);
+  }
+
+  if (!existingSnap.exists()) {
+    try {
       await setDoc(bundleRef, {
         snapshotId,
         ownerUid: uid,
@@ -479,16 +489,20 @@ export async function saveUserSnapshotBundle(
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
-    } else {
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, bundlePath);
+    }
+  } else {
+    try {
       await updateDoc(bundleRef, {
         captureMode,
         totalBytes,
         files: sanitizedFiles,
         updatedAt: serverTimestamp(),
       });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, bundlePath);
     }
-  } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, bundlePath);
   }
 }
 

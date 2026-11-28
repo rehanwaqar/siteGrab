@@ -11,6 +11,11 @@ import {
 } from 'lucide-react';
 import type { FeedbackCategory, FeedbackEntry, FeedbackSummary } from '../types';
 import { formatRelativeTime } from '../utils/format';
+import {
+  extractHttpErrorMessage,
+  fetchWithResilience,
+  readJsonSafe,
+} from '../utils/http';
 
 const CATEGORIES: FeedbackCategory[] = [
   'Experience',
@@ -47,9 +52,9 @@ export function FeedbackView() {
 
   useEffect(() => {
     let active = true;
-    fetch('/api/feedback')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data: FeedbackSummary | null) => {
+    fetchWithResilience('/api/feedback', { retries: 1 })
+      .then((res) => (res.ok ? readJsonSafe<FeedbackSummary>(res) : null))
+      .then((data) => {
         if (!active || !data) return;
         setItems(Array.isArray(data.items) ? data.items : []);
         setAverageRating(data.averageRating ?? null);
@@ -78,7 +83,7 @@ export function FeedbackView() {
     setSubmittedOk(false);
 
     try {
-      const res = await fetch('/api/feedback', {
+      const res = await fetchWithResilience('/api/feedback', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -88,15 +93,18 @@ export function FeedbackView() {
           experience: experience.trim(),
           suggestion: suggestion.trim(),
         }),
+        retries: 1,
       });
 
-      const data = (await res.json()) as FeedbackSummary & {
-        item?: FeedbackEntry;
-        error?: string;
-      };
+      const data = await readJsonSafe<
+        FeedbackSummary & {
+          item?: FeedbackEntry;
+          error?: string;
+        }
+      >(res);
 
-      if (!res.ok) {
-        setErrorMsg(data.error || 'Could not send feedback. Please try again.');
+      if (!res.ok || !data) {
+        setErrorMsg(extractHttpErrorMessage(res, data, 'Could not send feedback'));
         return;
       }
 
@@ -107,7 +115,7 @@ export function FeedbackView() {
       setSuggestion('');
       setSubmittedOk(true);
     } catch {
-      setErrorMsg('Network error sending feedback. Please try again.');
+      setErrorMsg('Connection interrupted while sending feedback. Please try again.');
     } finally {
       setIsSubmitting(false);
     }

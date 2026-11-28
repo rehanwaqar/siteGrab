@@ -12,6 +12,8 @@ export type CaptureStage =
 
 export type WaitStrategy = 'networkidle' | 'load' | 'domcontentloaded';
 
+export type CaptureStrategy = 'auto' | 'clone' | 'live';
+
 export interface CaptureOptions {
   url: string;
   crawlDepth: number;
@@ -23,6 +25,7 @@ export interface CaptureOptions {
   mobileViewport: boolean;
   saveScreenshots: boolean;
   preserveInternalNav: boolean;
+  captureStrategy?: CaptureStrategy;
   timeoutMs?: number;
   waitStrategy?: WaitStrategy;
 }

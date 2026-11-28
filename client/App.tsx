@@ -48,6 +48,7 @@ import type {
   CaptureMode,
   CaptureOptions,
   CaptureStats,
+  CaptureStrategy,
   DiagnosticReport,
   HistoryEntry,
   ProgressEvent,
@@ -58,6 +59,11 @@ import {
   formatDurationMs,
   formatRelativeTime,
 } from './utils/format';
+import {
+  extractHttpErrorMessage,
+  fetchWithResilience,
+  readJsonSafe,
+} from './utils/http';
 
 const THEME_STORAGE_KEY = 'sitegrab_theme_v1';
 
@@ -89,6 +95,7 @@ export default function App() {
   const [mobileViewport, setMobileViewport] = useState<boolean>(false);
   const [saveScreenshots, setSaveScreenshots] = useState<boolean>(false);
   const [preserveInternalNav, setPreserveInternalNav] = useState<boolean>(true);
+  const [captureStrategy, setCaptureStrategy] = useState<CaptureStrategy>('auto');
   const [autoDownload, setAutoDownload] = useState<boolean>(false);
 
   const [chromiumMissing, setChromiumMissing] = useState<boolean>(false);
@@ -239,13 +246,13 @@ export default function App() {
 
   const persistJobBundleToFirestore = useCallback(async (uid: string, jobId: string) => {
     try {
-      const authHeaders = await getAuthHeaders();
-      const res = await fetch(`/api/capture/${encodeURIComponent(jobId)}/bundle`, {
-        headers: authHeaders,
+      const res = await fetchWithResilience(`/api/capture/${encodeURIComponent(jobId)}/bundle`, {
+        useAuth: true,
+        retries: 1,
       });
       if (!res.ok) return;
-      const bundle = (await res.json()) as SavedPreviewBundle;
-      if (Array.isArray(bundle.files) && bundle.files.length > 0) {
+      const bundle = await readJsonSafe<SavedPreviewBundle>(res);
+      if (bundle && Array.isArray(bundle.files) && bundle.files.length > 0) {
         await saveUserSnapshotBundle(uid, jobId, bundle);
       }
     } catch (err) {
@@ -265,20 +272,14 @@ export default function App() {
     setDownloadPercent(0);
     setDownloadError(null);
     try {
-      const authHeaders = await getAuthHeaders();
-      const res = await fetch(`/api/capture/${encodeURIComponent(jobId)}/download`, {
+      const res = await fetchWithResilience(`/api/capture/${encodeURIComponent(jobId)}/download`, {
         cache: 'no-store',
-        headers: authHeaders,
+        useAuth: true,
+        retries: 1,
       });
       if (!res.ok) {
-        let errMsg = `Download failed (HTTP ${res.status}).`;
-        try {
-          const errJson = (await res.json()) as { error?: string };
-          if (errJson.error) errMsg = errJson.error;
-        } catch {
-          // Keep HTTP status message
-        }
-        setDownloadError(errMsg);
+        const errJson = await readJsonSafe<{ error?: string }>(res);
+        setDownloadError(extractHttpErrorMessage(res, errJson, 'Download failed'));
         return false;
       }
 
@@ -324,7 +325,7 @@ export default function App() {
       setDownloadComplete(true);
       return true;
     } catch {
-      setDownloadError('Network error while downloading the ZIP archive. Please click Download ZIP again.');
+      setDownloadError('Connection interrupted while downloading the ZIP archive. Please click Download ZIP again.');
       return false;
     } finally {
       setIsDownloading(false);
@@ -332,83 +333,168 @@ export default function App() {
     }
   }, []);
 
-  const finalizeCapture = async (
-    jobId: string,
-    event: ProgressEvent,
-    targetUrl: string,
-    host: string,
-    usedOptions: Omit<CaptureOptions, 'url'>,
-  ) => {
-    let resolvedTitle = host;
-    let resolvedZip = `sitegrab-${host}.zip`;
-    let resolvedFiles: CapturedFileEntry[] = event.files ?? [];
-    let resolvedDiagnostics: DiagnosticReport = event.diagnostics ?? EMPTY_DIAGNOSTICS;
-    let resolvedHasShot = Boolean(event.hasOriginalScreenshot);
-    let resolvedPreviewToken: string | null = null;
+  const finalizeCapture = useCallback(
+    async (
+      jobId: string,
+      event: ProgressEvent,
+      targetUrl: string,
+      host: string,
+      usedOptions: Omit<CaptureOptions, 'url'>,
+    ) => {
+      let resolvedTitle = host;
+      let resolvedZip = `sitegrab-${host}.zip`;
+      let resolvedFiles: CapturedFileEntry[] = event.files ?? [];
+      let resolvedDiagnostics: DiagnosticReport = event.diagnostics ?? EMPTY_DIAGNOSTICS;
+      let resolvedHasShot = Boolean(event.hasOriginalScreenshot);
+      let resolvedPreviewToken: string | null = null;
 
-    try {
-      await syncPreviewSessionCookie();
-      const authHeaders = await getAuthHeaders();
-      const statusRes = await fetch(`/api/capture/${encodeURIComponent(jobId)}/status`, {
-        headers: authHeaders,
-      });
-      if (statusRes.ok) {
-        const statusData = (await statusRes.json()) as {
-          siteTitle?: string;
-          zipFilename?: string;
-          previewToken?: string;
-          files?: CapturedFileEntry[];
-          diagnostics?: DiagnosticReport;
-          hasOriginalScreenshot?: boolean;
-        };
-        if (statusData.siteTitle) resolvedTitle = statusData.siteTitle;
-        if (statusData.zipFilename) resolvedZip = statusData.zipFilename;
-        if (statusData.previewToken) resolvedPreviewToken = statusData.previewToken;
-        if (Array.isArray(statusData.files)) resolvedFiles = statusData.files;
-        if (statusData.diagnostics) resolvedDiagnostics = statusData.diagnostics;
-        if (typeof statusData.hasOriginalScreenshot === 'boolean') {
-          resolvedHasShot = statusData.hasOriginalScreenshot;
+      try {
+        await syncPreviewSessionCookie();
+        const statusRes = await fetchWithResilience(`/api/capture/${encodeURIComponent(jobId)}/status`, {
+          useAuth: true,
+          cache: 'no-store',
+          retries: 1,
+        });
+        if (statusRes.ok) {
+          const statusData = await readJsonSafe<{
+            siteTitle?: string;
+            zipFilename?: string;
+            previewToken?: string;
+            files?: CapturedFileEntry[];
+            diagnostics?: DiagnosticReport;
+            hasOriginalScreenshot?: boolean;
+          }>(statusRes);
+          if (statusData) {
+            if (statusData.siteTitle) resolvedTitle = statusData.siteTitle;
+            if (statusData.zipFilename) resolvedZip = statusData.zipFilename;
+            if (statusData.previewToken) resolvedPreviewToken = statusData.previewToken;
+            if (Array.isArray(statusData.files)) resolvedFiles = statusData.files;
+            if (statusData.diagnostics) resolvedDiagnostics = statusData.diagnostics;
+            if (typeof statusData.hasOriginalScreenshot === 'boolean') {
+              resolvedHasShot = statusData.hasOriginalScreenshot;
+            }
+          }
+        }
+      } catch {
+        // Fall back to SSE event payload
+      }
+
+      setSiteTitle(resolvedTitle);
+      setZipFilename(resolvedZip);
+      setActivePreviewToken(resolvedPreviewToken);
+      setCapturedFiles(resolvedFiles);
+      setDiagnostics(resolvedDiagnostics);
+      setHasOriginalScreenshot(resolvedHasShot);
+      setProgressEvent(event);
+
+      const newEntry: HistoryEntry = {
+        id: jobId,
+        url: targetUrl,
+        hostname: host,
+        siteTitle: resolvedTitle,
+        zipFilename: resolvedZip,
+        capturedAt: Date.now(),
+        stats: event.stats,
+        options: usedOptions,
+      };
+
+      const user = currentUserRef.current;
+      if (user) {
+        void upsertUserProfile(user)
+          .catch(() => {})
+          .then(() => saveUserSnapshot(user.uid, newEntry))
+          .then(() => persistJobBundleToFirestore(user.uid, jobId))
+          .catch((err) => {
+            console.error('Failed to persist snapshot to Firestore:', err);
+          });
+      }
+
+      if (autoDownloadRef.current) {
+        await downloadZipByJobId(jobId, resolvedZip);
+      }
+    },
+    [downloadZipByJobId, persistJobBundleToFirestore],
+  );
+
+  const pollCaptureUntilSettled = useCallback(
+    async (
+      jobId: string,
+      resolvedUrl: string,
+      host: string,
+      opts: Omit<CaptureOptions, 'url'>,
+      signal: AbortSignal,
+    ): Promise<boolean> => {
+      let consecutiveFailures = 0;
+      const maxPolls = 100; // ~2 minutes
+
+      for (let i = 0; i < maxPolls; i++) {
+        if (signal.aborted) return true;
+        await new Promise((r) => setTimeout(r, 1200));
+        if (signal.aborted) return true;
+
+        try {
+          const statusRes = await fetchWithResilience(`/api/capture/${encodeURIComponent(jobId)}/status`, {
+            useAuth: true,
+            cache: 'no-store',
+            signal,
+            retries: 1,
+          });
+
+          if (statusRes.status === 404) {
+            return false;
+          }
+          if (!statusRes.ok) {
+            consecutiveFailures += 1;
+            if (consecutiveFailures >= 5) return false;
+            continue;
+          }
+
+          const statusEvt = await readJsonSafe<ProgressEvent>(statusRes);
+          if (!statusEvt || !statusEvt.stage) {
+            consecutiveFailures += 1;
+            if (consecutiveFailures >= 5) return false;
+            continue;
+          }
+
+          consecutiveFailures = 0;
+
+          if (statusEvt.stage === 'ready') {
+            setIsCapturing(false);
+            await finalizeCapture(jobId, statusEvt, resolvedUrl, host, opts);
+            return true;
+          }
+
+          if (statusEvt.stage === 'error') {
+            setProgressEvent(statusEvt);
+            setIsCapturing(false);
+            setErrorState({
+              code: statusEvt.errorCode,
+              message: statusEvt.message,
+            });
+            return true;
+          }
+
+          setProgressEvent(statusEvt);
+        } catch (err) {
+          if (err instanceof DOMException && err.name === 'AbortError') {
+            return true;
+          }
+          consecutiveFailures += 1;
+          if (consecutiveFailures >= 5) {
+            return false;
+          }
         }
       }
-    } catch {
-      // Fall back to SSE event payload
-    }
 
-    setSiteTitle(resolvedTitle);
-    setZipFilename(resolvedZip);
-    setActivePreviewToken(resolvedPreviewToken);
-    setCapturedFiles(resolvedFiles);
-    setDiagnostics(resolvedDiagnostics);
-    setHasOriginalScreenshot(resolvedHasShot);
-    setProgressEvent(event);
-
-    const newEntry: HistoryEntry = {
-      id: jobId,
-      url: targetUrl,
-      hostname: host,
-      siteTitle: resolvedTitle,
-      zipFilename: resolvedZip,
-      capturedAt: Date.now(),
-      stats: event.stats,
-      options: usedOptions,
-    };
-
-    const user = currentUserRef.current;
-    if (user) {
-      void saveUserSnapshot(user.uid, newEntry)
-        .then(() => persistJobBundleToFirestore(user.uid, jobId))
-        .catch((err) => {
-          console.error('Failed to persist snapshot to Firestore:', err);
-        });
-    }
-
-    if (autoDownloadRef.current) {
-      await downloadZipByJobId(jobId, resolvedZip);
-    }
-  };
+      return false;
+    },
+    [finalizeCapture],
+  );
 
   const executeCapture = useCallback(
     async (rawTargetUrl: string, customOptions?: Omit<CaptureOptions, 'url'>) => {
+      if (isCapturing || isProcessingUpload) return;
+
       const trimmed = rawTargetUrl.trim();
       if (!trimmed) {
         setErrorState({
@@ -432,6 +518,7 @@ export default function App() {
         mobileViewport,
         saveScreenshots,
         preserveInternalNav,
+        captureStrategy,
       };
 
       closeActiveStream();
@@ -446,117 +533,47 @@ export default function App() {
       setDownloadError(null);
       setIsCapturing(true);
 
+      let jobId = '';
+      let host = '';
+      let resolvedUrl = normalizedInput;
+
       try {
-        const authHeaders = await getAuthHeaders();
-        const response = await fetch('/api/capture', {
+        const response = await fetchWithResilience('/api/capture', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...authHeaders,
-          },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             url: normalizedInput,
             ...opts,
           }),
+          useAuth: true,
+          retries: 1,
         });
 
-        const data = (await response.json()) as {
+        const data = await readJsonSafe<{
           jobId?: string;
           url?: string;
           hostname?: string;
           error?: string;
           errorCode?: string;
-        };
+        }>(response);
 
-        if (!response.ok || !data.jobId) {
+        if (!response.ok || !data?.jobId) {
           setIsCapturing(false);
           setErrorState({
-            code: data.errorCode || (response.status === 429 ? 'RATE_LIMITED' : 'CAPTURE_FAILED'),
-            message: data.error || 'Could not start capture job.',
+            code: data?.errorCode || (response.status === 429 ? 'RATE_LIMITED' : 'CAPTURE_FAILED'),
+            message: extractHttpErrorMessage(response, data, 'Could not start capture job'),
           });
           return;
         }
 
-        const jobId = data.jobId;
-        const host = data.hostname || '';
-        const resolvedUrl = data.url || normalizedInput;
+        jobId = data.jobId;
+        host = data.hostname || '';
+        resolvedUrl = data.url || normalizedInput;
         setUrlInput(resolvedUrl);
         setActiveJobId(jobId);
         setActiveHostname(host);
         setSiteTitle(host);
         setZipFilename(`sitegrab-${host}.zip`);
-
-        const controller = new AbortController();
-        streamAbortRef.current = controller;
-
-        const streamHeaders = await getAuthHeaders();
-        const sseRes = await fetch(`/api/capture/${encodeURIComponent(jobId)}/events`, {
-          headers: streamHeaders,
-          signal: controller.signal,
-        });
-
-        if (!sseRes.ok || !sseRes.body) {
-          throw new Error('Could not open capture progress stream.');
-        }
-
-        const reader = sseRes.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        let finished = false;
-
-        while (!finished) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-
-          let sepIndex: number;
-          while ((sepIndex = buffer.indexOf('\n\n')) !== -1) {
-            const rawChunk = buffer.slice(0, sepIndex);
-            buffer = buffer.slice(sepIndex + 2);
-
-            const dataLine = rawChunk
-              .split('\n')
-              .find((line) => line.startsWith('data:'));
-            if (!dataLine) continue;
-
-            try {
-              const evt = JSON.parse(dataLine.slice(5).trim()) as ProgressEvent;
-              if (evt.stage === 'ready') {
-                finished = true;
-                controller.abort();
-                streamAbortRef.current = null;
-                setIsCapturing(false);
-                await finalizeCapture(jobId, evt, resolvedUrl, host, opts);
-                break;
-              } else if (evt.stage === 'error') {
-                finished = true;
-                controller.abort();
-                streamAbortRef.current = null;
-                setProgressEvent(evt);
-                setIsCapturing(false);
-                setErrorState({
-                  code: evt.errorCode,
-                  message: evt.message,
-                });
-                break;
-              } else {
-                setProgressEvent(evt);
-              }
-            } catch {
-              // Ignore malformed event line
-            }
-          }
-        }
-
-        if (!finished && !controller.signal.aborted) {
-          setIsCapturing(false);
-          setErrorState((prev) =>
-            prev ?? {
-              code: 'CONNECTION_LOST',
-              message: 'Lost live progress connection. Click Retry to try again.',
-            },
-          );
-        }
       } catch (err) {
         if (err instanceof DOMException && err.name === 'AbortError') {
           return;
@@ -564,11 +581,100 @@ export default function App() {
         setIsCapturing(false);
         setErrorState({
           code: 'NETWORK_ERROR',
-          message: 'Could not reach the SiteGrab server. Please check your connection and retry.',
+          message: 'Could not reach the SiteGrab server to start capture. Please retry.',
         });
+        return;
+      }
+
+      const controller = new AbortController();
+      streamAbortRef.current = controller;
+      let finished = false;
+
+      try {
+        const streamHeaders = await getAuthHeaders();
+        const sseRes = await fetch(`/api/capture/${encodeURIComponent(jobId)}/events`, {
+          headers: streamHeaders,
+          signal: controller.signal,
+        });
+
+        if (sseRes.ok && sseRes.body) {
+          const reader = sseRes.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
+
+          while (!finished) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+
+            let sepIndex: number;
+            while ((sepIndex = buffer.indexOf('\n\n')) !== -1) {
+              const rawChunk = buffer.slice(0, sepIndex);
+              buffer = buffer.slice(sepIndex + 2);
+
+              const dataLine = rawChunk
+                .split('\n')
+                .find((line) => line.startsWith('data:'));
+              if (!dataLine) continue;
+
+              try {
+                const evt = JSON.parse(dataLine.slice(5).trim()) as ProgressEvent;
+                if (evt.stage === 'ready') {
+                  finished = true;
+                  controller.abort();
+                  streamAbortRef.current = null;
+                  setIsCapturing(false);
+                  await finalizeCapture(jobId, evt, resolvedUrl, host, opts);
+                  break;
+                } else if (evt.stage === 'error') {
+                  finished = true;
+                  controller.abort();
+                  streamAbortRef.current = null;
+                  setProgressEvent(evt);
+                  setIsCapturing(false);
+                  setErrorState({
+                    code: evt.errorCode,
+                    message: evt.message,
+                  });
+                  break;
+                } else {
+                  setProgressEvent(evt);
+                }
+              } catch {
+                // Ignore malformed event or heartbeat comment
+              }
+            }
+          }
+        }
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError' && finished) {
+          return;
+        }
+        // SSE stream dropped or blocked by proxy — seamlessly fall through to /status polling below
+      }
+
+      if (!finished && !controller.signal.aborted) {
+        const recovered = await pollCaptureUntilSettled(
+          jobId,
+          resolvedUrl,
+          host,
+          opts,
+          controller.signal,
+        );
+        if (!recovered && !controller.signal.aborted) {
+          setIsCapturing(false);
+          setErrorState((prev) =>
+            prev ?? {
+              code: 'TIMEOUT',
+              message: 'Capture took longer than expected or lost connection. Click Retry Capture to try again.',
+            },
+          );
+        }
       }
     },
     [
+      isCapturing,
+      isProcessingUpload,
       closeActiveStream,
       crawlDepth,
       maxPages,
@@ -579,6 +685,9 @@ export default function App() {
       mobileViewport,
       saveScreenshots,
       preserveInternalNav,
+      captureStrategy,
+      finalizeCapture,
+      pollCaptureUntilSettled,
     ],
   );
 
@@ -598,6 +707,7 @@ export default function App() {
       mobileViewport,
       saveScreenshots,
       preserveInternalNav,
+      captureStrategy,
       timeoutMs: recovery.timeoutMs,
       waitStrategy: recovery.waitStrategy,
     });
@@ -608,11 +718,9 @@ export default function App() {
     setDownloadComplete(false);
     setDownloadError(null);
 
-    const authHeaders = await getAuthHeaders();
-    const res = await fetch('/api/capture/import-zip', {
+    const res = await fetchWithResilience('/api/capture/import-zip', {
       method: 'POST',
       headers: {
-        ...authHeaders,
         'Content-Type': 'application/zip',
         'X-Zip-Filename': file.name,
         'X-Format-Code': String(formatCode),
@@ -621,9 +729,11 @@ export default function App() {
         'X-Preserve-Nav': String(preserveInternalNav),
       },
       body: file,
+      useAuth: true,
+      retries: 1,
     });
 
-    const data = (await res.json()) as {
+    const data = await readJsonSafe<{
       jobId?: string;
       url?: string;
       hostname?: string;
@@ -632,10 +742,10 @@ export default function App() {
       previewToken?: string;
       event?: ProgressEvent;
       error?: string;
-    };
+    }>(res);
 
-    if (!res.ok || !data.jobId || !data.event) {
-      throw new Error(data.error || 'Could not extract the uploaded ZIP archive.');
+    if (!res.ok || !data?.jobId || !data?.event) {
+      throw new Error(extractHttpErrorMessage(res, data, 'Could not extract the uploaded ZIP archive'));
     }
 
     await syncPreviewSessionCookie();
@@ -678,7 +788,9 @@ export default function App() {
     };
     const user = currentUserRef.current;
     if (user) {
-      void saveUserSnapshot(user.uid, importedEntry)
+      void upsertUserProfile(user)
+        .catch(() => {})
+        .then(() => saveUserSnapshot(user.uid, importedEntry))
         .then(() => persistJobBundleToFirestore(user.uid, data.jobId!))
         .catch((err) => {
           console.error('Failed to persist ZIP snapshot to Firestore:', err);
@@ -724,9 +836,7 @@ export default function App() {
       },
     });
 
-    const authHeaders = await getAuthHeaders();
     const headers: Record<string, string> = {
-      ...authHeaders,
       'Content-Type': file.type || 'image/png',
       'X-Screenshot-Filename': file.name,
       'X-Format-Code': String(formatCode),
@@ -735,13 +845,21 @@ export default function App() {
       headers['X-Screenshot-Notes'] = notes.trim().slice(0, 1200);
     }
 
-    const res = await fetch('/api/capture/from-screenshot', {
-      method: 'POST',
-      headers,
-      body: file,
-    });
+    let res: Response;
+    try {
+      res = await fetchWithResilience('/api/capture/from-screenshot', {
+        method: 'POST',
+        headers,
+        body: file,
+        useAuth: true,
+        retries: 1,
+      });
+    } catch (err) {
+      setProgressEvent(null);
+      throw err;
+    }
 
-    const data = (await res.json()) as {
+    const data = await readJsonSafe<{
       jobId?: string;
       url?: string;
       hostname?: string;
@@ -750,11 +868,13 @@ export default function App() {
       previewToken?: string;
       event?: ProgressEvent;
       error?: string;
-    };
+    }>(res);
 
-    if (!res.ok || !data.jobId || !data.event) {
+    if (!res.ok || !data?.jobId || !data?.event) {
       setProgressEvent(null);
-      throw new Error(data.error || 'Could not generate website from the uploaded screenshot.');
+      throw new Error(
+        extractHttpErrorMessage(res, data, 'Could not generate website from the uploaded screenshot'),
+      );
     }
 
     await syncPreviewSessionCookie();
@@ -798,7 +918,9 @@ export default function App() {
     };
     const user = currentUserRef.current;
     if (user) {
-      void saveUserSnapshot(user.uid, generatedEntry)
+      void upsertUserProfile(user)
+        .catch(() => {})
+        .then(() => saveUserSnapshot(user.uid, generatedEntry))
         .then(() => persistJobBundleToFirestore(user.uid, data.jobId!))
         .catch((err) => {
           console.error('Failed to persist screenshot snapshot to Firestore:', err);
@@ -864,6 +986,7 @@ export default function App() {
       mobileViewport: entry.options.mobileViewport ?? false,
       saveScreenshots: entry.options.saveScreenshots ?? false,
       preserveInternalNav: entry.options.preserveInternalNav ?? true,
+      captureStrategy: entry.options.captureStrategy ?? 'auto',
     };
 
     setUrlInput(entry.url);
@@ -876,6 +999,7 @@ export default function App() {
     setMobileViewport(restoredOpts.mobileViewport);
     setSaveScreenshots(restoredOpts.saveScreenshots);
     setPreserveInternalNav(restoredOpts.preserveInternalNav);
+    setCaptureStrategy(restoredOpts.captureStrategy ?? 'auto');
     setErrorState(null);
     setActiveView('capture');
 
@@ -887,21 +1011,24 @@ export default function App() {
   const restoreWorkspaceForHistoryEntry = useCallback(
     async (entry: HistoryEntry): Promise<HistoryPreviewWorkspace | null> => {
       const user = currentUserRef.current;
-      const authHeaders = await getAuthHeaders();
 
       // 1. Check if workspace is active in server memory or disk cache
       try {
-        const statusRes = await fetch(`/api/capture/${encodeURIComponent(entry.id)}/status`, {
-          headers: authHeaders,
+        const statusRes = await fetchWithResilience(`/api/capture/${encodeURIComponent(entry.id)}/status`, {
+          useAuth: true,
+          cache: 'no-store',
+          retries: 1,
         });
         if (statusRes.ok) {
-          const statusData = (await statusRes.json()) as ProgressEvent & {
-            siteTitle?: string;
-            hostname?: string;
-            zipFilename?: string;
-            previewToken?: string;
-          };
-          if (statusData.stage === 'ready') {
+          const statusData = await readJsonSafe<
+            ProgressEvent & {
+              siteTitle?: string;
+              hostname?: string;
+              zipFilename?: string;
+              previewToken?: string;
+            }
+          >(statusRes);
+          if (statusData && statusData.stage === 'ready') {
             return {
               entryId: entry.id,
               jobId: entry.id,
@@ -927,12 +1054,9 @@ export default function App() {
         return null;
       }
 
-      const restoreRes = await fetch('/api/capture/restore', {
+      const restoreRes = await fetchWithResilience('/api/capture/restore', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...authHeaders,
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           snapshotId: entry.id,
           url: entry.url,
@@ -944,13 +1068,15 @@ export default function App() {
           options: entry.options,
           files: savedBundle.files,
         }),
+        useAuth: true,
+        retries: 1,
       });
 
       if (!restoreRes.ok) {
         return null;
       }
 
-      const restored = (await restoreRes.json()) as {
+      const restored = await readJsonSafe<{
         jobId: string;
         previewToken?: string;
         event: ProgressEvent;
@@ -961,7 +1087,11 @@ export default function App() {
         diagnostics?: DiagnosticReport;
         hasOriginalScreenshot?: boolean;
         captureMode?: CaptureMode;
-      };
+      }>(restoreRes);
+
+      if (!restored?.jobId) {
+        return null;
+      }
 
       return {
         entryId: entry.id,
@@ -1316,13 +1446,13 @@ export default function App() {
                       placeholder="https://example.com"
                       value={urlInput}
                       onChange={(e) => setUrlInput(e.target.value)}
-                      disabled={isCapturing}
+                      disabled={isCapturing || isProcessingUpload}
                       className="h-12 w-full rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#111827] pl-10 pr-4 text-sm font-mono text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/20 disabled:opacity-60"
                     />
                   </div>
                   <button
                     type="submit"
-                    disabled={isCapturing}
+                    disabled={isCapturing || isProcessingUpload}
                     className="h-12 inline-flex items-center justify-center gap-2 rounded-xl bg-sky-600 hover:bg-sky-500 disabled:bg-sky-600/60 px-6 text-sm font-semibold text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:cursor-wait focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-500"
                   >
                     {isCapturing ? (
@@ -1506,6 +1636,7 @@ export default function App() {
             {/* Smart Capture Failure Recovery (shown immediately below URL form when capture fails) */}
             {errorState && !isCapturing && (
               <FailureRecoveryPanel
+                key={`${errorState.code ?? 'err'}-${errorState.message}`}
                 errorCode={errorState.code}
                 errorMessage={errorState.message}
                 targetUrl={urlInput}
@@ -1525,6 +1656,7 @@ export default function App() {
               <>
                 <ResultsDashboard stats={progressEvent.stats} hostname={activeHostname} />
                 <PreviewPanel
+                  key={activeJobId}
                   jobId={activeJobId}
                   previewToken={activePreviewToken}
                   siteTitle={siteTitle}
@@ -1735,6 +1867,45 @@ export default function App() {
                     className="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
                   />
                 </label>
+              </div>
+
+              {/* Row 3: Capture & Clone Strategy */}
+              <div className="mt-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-4 border-t border-slate-100 dark:border-slate-800">
+                <div>
+                  <div className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+                    Build Strategy
+                  </div>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    Smart Auto detects complex web apps (e.g. YouTube) and builds full interactive features automatically.
+                  </p>
+                </div>
+                <div
+                  role="group"
+                  aria-label="Build strategy"
+                  className="grid grid-cols-3 gap-1 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-[#0B0F17] p-1 shrink-0"
+                >
+                  {(
+                    [
+                      { value: 'auto', label: 'Smart Auto' },
+                      { value: 'clone', label: 'App Clone' },
+                      { value: 'live', label: 'Live HTML' },
+                    ] as const
+                  ).map((opt) => (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      disabled={isCapturing}
+                      onClick={() => setCaptureStrategy(opt.value)}
+                      className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap cursor-pointer ${
+                        captureStrategy === opt.value
+                          ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100 shadow-xs'
+                          : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
               </div>
             </section>
 

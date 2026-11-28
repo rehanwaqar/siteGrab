@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import type { NextFunction, Request, Response } from 'express';
 import { getApp, getApps, initializeApp, type App } from 'firebase-admin/app';
@@ -24,15 +25,36 @@ declare global {
 const PREVIEW_COOKIE_NAME = 'sitegrab_preview';
 const PREVIEW_TTL_MS = 30 * 60 * 1000;
 
-// In-memory CSPRNG fallback when SESSION_SECRET env var is unset
-const EPHEMERAL_SESSION_KEY = crypto.randomBytes(32);
+// Persistent local CSPRNG fallback when SESSION_SECRET env var is unset so preview tokens survive server restarts
+let cachedFallbackKey: Buffer | null = null;
+
+function loadOrCreateFallbackKey(): Buffer {
+  if (cachedFallbackKey) return cachedFallbackKey;
+  const keyPath = path.join(os.tmpdir(), 'sitegrab-session.key');
+  try {
+    if (fs.existsSync(keyPath)) {
+      const existing = fs.readFileSync(keyPath);
+      if (existing.length === 32) {
+        cachedFallbackKey = existing;
+        return existing;
+      }
+    }
+    const generated = crypto.randomBytes(32);
+    fs.writeFileSync(keyPath, generated, { mode: 0o600 });
+    cachedFallbackKey = generated;
+    return generated;
+  } catch {
+    cachedFallbackKey = crypto.randomBytes(32);
+    return cachedFallbackKey;
+  }
+}
 
 function getSigningKey(): Buffer {
   const envSecret = process.env.SESSION_SECRET?.trim();
   if (envSecret && envSecret.length >= 16) {
     return crypto.createHash('sha256').update(envSecret).digest();
   }
-  return EPHEMERAL_SESSION_KEY;
+  return loadOrCreateFallbackKey();
 }
 
 let adminApp: App | null = null;

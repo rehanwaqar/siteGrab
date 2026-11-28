@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AlertCircle,
   Bot,
@@ -10,12 +10,14 @@ import {
   FolderTree,
   Info,
   Loader2,
+  Maximize2,
+  Minimize2,
   Monitor,
+  RefreshCw,
   RotateCcw,
   Smartphone,
   Tablet,
 } from 'lucide-react';
-import { getAuthHeaders } from '../firebase';
 import type {
   CapturedFileEntry,
   CaptureStats,
@@ -23,6 +25,11 @@ import type {
   ProgressEvent,
 } from '../types';
 import { formatBytes } from '../utils/format';
+import {
+  extractHttpErrorMessage,
+  fetchWithResilience,
+  readJsonSafe,
+} from '../utils/http';
 import { AiAssistantPanel } from './AiAssistantPanel';
 
 interface PreviewPanelProps {
@@ -71,11 +78,16 @@ export function PreviewPanel({
   const [activeTab, setActiveTab] = useState<'preview' | 'files' | 'diagnostics' | 'ai'>('preview');
   const [viewportMode, setViewportMode] = useState<'desktop' | 'tablet' | 'mobile'>('desktop');
   const [compareMode, setCompareMode] = useState<boolean>(false);
+  const [expandedHeight, setExpandedHeight] = useState<boolean>(false);
   const [previewRevision, setPreviewRevision] = useState<number>(0);
   const [resolvedPreviewToken, setResolvedPreviewToken] = useState<string | null>(
     propPreviewToken ?? null,
   );
+  const [isIframeLoading, setIsIframeLoading] = useState<boolean>(true);
+  const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
+  const [previewUnavailable, setPreviewUnavailable] = useState<string | null>(null);
   const [originalScreenshotBlobUrl, setOriginalScreenshotBlobUrl] = useState<string | null>(null);
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
 
   const [inspectedFile, setInspectedFile] = useState<{
     path: string;
@@ -84,38 +96,115 @@ export function PreviewPanel({
     error?: string;
   } | null>(null);
 
+  const fetchFreshPreviewToken = useCallback(async (): Promise<string | null> => {
+    try {
+      const res = await fetchWithResilience(
+        `/api/capture/${encodeURIComponent(jobId)}/preview-token`,
+        { method: 'POST', useAuth: true, retries: 1 },
+      );
+      if (!res.ok) return null;
+      const data = await readJsonSafe<{ previewToken?: string }>(res);
+      if (data?.previewToken) {
+        setResolvedPreviewToken(data.previewToken);
+        return data.previewToken;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }, [jobId]);
+
   useEffect(() => {
     setResolvedPreviewToken(propPreviewToken ?? null);
+    setPreviewUnavailable(null);
     if (propPreviewToken) return;
 
     let cancelled = false;
     void (async () => {
-      try {
-        const authHeaders = await getAuthHeaders();
-        const res = await fetch(
-          `/api/capture/${encodeURIComponent(jobId)}/preview-token`,
-          { method: 'POST', headers: authHeaders },
-        );
-        if (!res.ok || cancelled) return;
-        const data = (await res.json()) as { previewToken?: string };
-        if (!cancelled && data.previewToken) {
-          setResolvedPreviewToken(data.previewToken);
-        }
-      } catch {
-        // Fallback handled gracefully
+      const token = await fetchFreshPreviewToken();
+      if (!cancelled && !token) {
+        setPreviewUnavailable('Could not initialize preview session. Click Reload Preview or Recapture.');
       }
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [jobId, propPreviewToken]);
+  }, [jobId, propPreviewToken, fetchFreshPreviewToken]);
+
+  const handleRefreshPreview = async () => {
+    setIsRefreshing(true);
+    setPreviewUnavailable(null);
+    setIsIframeLoading(true);
+    try {
+      const fresh = await fetchFreshPreviewToken();
+      if (!fresh && !resolvedPreviewToken && !propPreviewToken) {
+        setPreviewUnavailable('Preview workspace is no longer available on the server.');
+      }
+    } finally {
+      setPreviewRevision((r) => r + 1);
+      setIsRefreshing(false);
+    }
+  };
 
   const activeToken = resolvedPreviewToken || propPreviewToken || '';
   const previewUrl = activeToken
     ? `/api/capture/${encodeURIComponent(jobId)}/p/${encodeURIComponent(activeToken)}/index.html?rev=${previewRevision}`
     : null;
   const rootFolder = zipFilename.replace(/\.zip$/i, '') || `sitegrab-${hostname}`;
+
+  // Preflight check so an expired preview token automatically refreshes and a 404 shows clean recovery UI
+  useEffect(() => {
+    if (!previewUrl || activeTab !== 'preview') return;
+    let cancelled = false;
+    setIsIframeLoading(true);
+    setPreviewUnavailable(null);
+
+    const safetyTimer = window.setTimeout(() => {
+      if (!cancelled) setIsIframeLoading(false);
+    }, 4500);
+
+    void (async () => {
+      try {
+        const res = await fetch(previewUrl, { method: 'HEAD', cache: 'no-store' });
+        if (cancelled) return;
+        if (res.status === 401) {
+          const fresh = await fetchFreshPreviewToken();
+          if (cancelled) return;
+          if (!fresh) {
+            setPreviewUnavailable('Preview session expired. Click Recapture to rebuild.');
+            setIsIframeLoading(false);
+          }
+          return;
+        }
+        if (res.status === 404) {
+          setPreviewUnavailable('Preview workspace expired from temporary storage. Click Recapture to regenerate.');
+          setIsIframeLoading(false);
+        }
+      } catch {
+        // Let iframe attempt direct load if HEAD preflight fails transiently
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(safetyTimer);
+    };
+  }, [previewUrl, activeTab, fetchFreshPreviewToken]);
+
+  // Clear loading indicator promptly when preview runtime reports ready via postMessage
+  useEffect(() => {
+    const onMessage = (ev: MessageEvent) => {
+      if (iframeRef.current?.contentWindow && ev.source !== iframeRef.current.contentWindow) {
+        return;
+      }
+      if (ev.data && typeof ev.data === 'object' && (ev.data as { type?: string }).type === 'sitegrab:preview-ready') {
+        setIsIframeLoading(false);
+      }
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, []);
 
   useEffect(() => {
     if (!hasOriginalScreenshot) {
@@ -128,10 +217,9 @@ export function PreviewPanel({
 
     void (async () => {
       try {
-        const authHeaders = await getAuthHeaders();
-        const res = await fetch(
+        const res = await fetchWithResilience(
           `/api/capture/${encodeURIComponent(jobId)}/original-screenshot`,
-          { headers: authHeaders, cache: 'no-store' },
+          { useAuth: true, cache: 'no-store', retries: 1 },
         );
         if (!res.ok || cancelled) return;
         const blob = await res.blob();
@@ -170,18 +258,17 @@ export function PreviewPanel({
 
     setInspectedFile({ path: relPath, content: '', loading: true });
     try {
-      const authHeaders = await getAuthHeaders();
-      const res = await fetch(
+      const res = await fetchWithResilience(
         `/api/capture/${encodeURIComponent(jobId)}/file?path=${encodeURIComponent(relPath)}`,
-        { headers: authHeaders },
+        { useAuth: true, retries: 1 },
       );
-      const data = (await res.json()) as { content?: string; error?: string };
-      if (!res.ok || typeof data.content !== 'string') {
+      const data = await readJsonSafe<{ content?: string; error?: string }>(res);
+      if (!res.ok || typeof data?.content !== 'string') {
         setInspectedFile({
           path: relPath,
           content: '',
           loading: false,
-          error: data.error || 'Could not load file.',
+          error: extractHttpErrorMessage(res, data, 'Could not load file'),
         });
         return;
       }
@@ -191,7 +278,7 @@ export function PreviewPanel({
         path: relPath,
         content: '',
         loading: false,
-        error: 'Network error reading file.',
+        error: 'Connection interrupted while reading file. Click to try again.',
       });
     }
   };
@@ -388,21 +475,45 @@ export function PreviewPanel({
               </button>
             </div>
 
-            {/* Original vs. Captured Comparison Toggle */}
-            {hasOriginalScreenshot && (
+            <div className="flex flex-wrap items-center gap-2">
+              {hasOriginalScreenshot && (
+                <button
+                  type="button"
+                  onClick={() => setCompareMode((prev) => !prev)}
+                  className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                    compareMode
+                      ? 'border-sky-500 bg-sky-600 text-white'
+                      : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800'
+                  }`}
+                >
+                  <Columns2 className="h-3.5 w-3.5" />
+                  <span>{compareMode ? 'Exit Comparison' : 'Compare Original vs. Captured'}</span>
+                </button>
+              )}
               <button
                 type="button"
-                onClick={() => setCompareMode((prev) => !prev)}
-                className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                  compareMode
-                    ? 'border-sky-500 bg-sky-600 text-white'
-                    : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800'
-                }`}
+                onClick={() => setExpandedHeight((prev) => !prev)}
+                title={expandedHeight ? 'Compact preview height' : 'Expand preview height'}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] px-2.5 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
-                <Columns2 className="h-3.5 w-3.5" />
-                <span>{compareMode ? 'Exit Comparison' : 'Compare Original vs. Captured'}</span>
+                {expandedHeight ? (
+                  <Minimize2 className="h-3.5 w-3.5" />
+                ) : (
+                  <Maximize2 className="h-3.5 w-3.5" />
+                )}
+                <span>{expandedHeight ? 'Compact' : 'Expand'}</span>
               </button>
-            )}
+              <button
+                type="button"
+                disabled={isRefreshing}
+                onClick={() => void handleRefreshPreview()}
+                title="Reload preview"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] px-2.5 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${isRefreshing ? 'animate-spin' : ''}`} />
+                <span>Reload Preview</span>
+              </button>
+            </div>
           </div>
 
           {compareMode && hasOriginalScreenshot ? (
@@ -411,7 +522,11 @@ export function PreviewPanel({
                 <div className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-[#111827] px-3 py-2 text-xs font-mono text-slate-600 dark:text-slate-300">
                   Original Live Render (Chromium Screenshot)
                 </div>
-                <div className="flex-1 bg-slate-950 flex items-start justify-center overflow-auto max-h-[480px]">
+                <div
+                  className={`flex-1 bg-slate-950 flex items-start justify-center overflow-auto ${
+                    expandedHeight ? 'max-h-[680px]' : 'max-h-[520px]'
+                  }`}
+                >
                   {originalScreenshotBlobUrl ? (
                     <img
                       src={originalScreenshotBlobUrl}
@@ -424,19 +539,55 @@ export function PreviewPanel({
                 </div>
               </div>
 
-              <div className="overflow-hidden rounded-lg border border-slate-200 dark:border-slate-800 bg-white flex flex-col">
+              <div className="overflow-hidden rounded-lg border border-slate-200 dark:border-slate-800 bg-white flex flex-col relative">
                 <div className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-[#111827] px-3 py-2 text-xs font-mono text-slate-600 dark:text-slate-300">
                   Captured Offline Bundle ({rootFolder}/index.html)
                 </div>
-                {previewUrl ? (
-                  <iframe
-                    title={`Captured preview of ${hostname}`}
-                    src={previewUrl}
-                    sandbox="allow-scripts allow-forms"
-                    className="h-[480px] w-full bg-white"
-                  />
+                {previewUnavailable ? (
+                  <div
+                    className={`${
+                      expandedHeight ? 'h-[680px]' : 'h-[520px]'
+                    } w-full flex flex-col items-center justify-center bg-slate-950 text-xs text-slate-300 gap-3 px-6 text-center`}
+                  >
+                    <AlertCircle className="h-6 w-6 text-amber-400" />
+                    <p>{previewUnavailable}</p>
+                    <button
+                      type="button"
+                      onClick={onRecapture}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 px-3.5 py-2 text-xs font-semibold text-white cursor-pointer"
+                    >
+                      <RotateCcw className="h-3.5 w-3.5" />
+                      <span>Recapture Site</span>
+                    </button>
+                  </div>
+                ) : previewUrl ? (
+                  <div className="relative">
+                    {isIframeLoading && (
+                      <div className="pointer-events-none absolute top-3 right-3 z-10 inline-flex items-center gap-1.5 rounded-full border border-slate-200 dark:border-slate-700 bg-white/90 dark:bg-slate-900/90 px-2.5 py-1 text-[11px] font-medium text-slate-700 dark:text-slate-200 shadow-sm">
+                        <Loader2 className="h-3 w-3 animate-spin text-sky-500" />
+                        <span>Loading preview...</span>
+                      </div>
+                    )}
+                    <iframe
+                      ref={iframeRef}
+                      key={`${jobId}-compare-${previewRevision}`}
+                      title={`Captured preview of ${hostname}`}
+                      src={previewUrl}
+                      sandbox="allow-scripts allow-forms"
+                      onLoad={() => setIsIframeLoading(false)}
+                      onError={() => {
+                        setIsIframeLoading(false);
+                        setPreviewUnavailable('Unable to load preview frame. Click Reload Preview or Recapture.');
+                      }}
+                      className={`${expandedHeight ? 'h-[680px]' : 'h-[520px]'} w-full bg-white`}
+                    />
+                  </div>
                 ) : (
-                  <div className="h-[480px] w-full flex items-center justify-center bg-slate-950 text-xs text-slate-400 gap-2">
+                  <div
+                    className={`${
+                      expandedHeight ? 'h-[680px]' : 'h-[520px]'
+                    } w-full flex items-center justify-center bg-slate-950 text-xs text-slate-400 gap-2`}
+                  >
                     <Loader2 className="h-4 w-4 animate-spin text-sky-500" />
                     <span>Preparing preview...</span>
                   </div>
@@ -457,16 +608,60 @@ export function PreviewPanel({
                 <span className="truncate">
                   {rootFolder}/index.html · {viewportMode} viewport
                 </span>
+                {isIframeLoading && previewUrl && !previewUnavailable && (
+                  <span className="inline-flex items-center gap-1.5 text-sky-600 dark:text-sky-400 shrink-0">
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                    <span>Loading...</span>
+                  </span>
+                )}
               </div>
-              {previewUrl ? (
+              {previewUnavailable ? (
+                <div
+                  className={`${
+                    expandedHeight ? 'h-[680px]' : 'h-[520px]'
+                  } w-full flex flex-col items-center justify-center bg-slate-950 text-xs text-slate-300 gap-3 px-6 text-center`}
+                >
+                  <AlertCircle className="h-6 w-6 text-amber-400" />
+                  <p className="max-w-md">{previewUnavailable}</p>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void handleRefreshPreview()}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800 hover:bg-slate-700 px-3 py-2 text-xs font-medium text-white cursor-pointer"
+                    >
+                      <RefreshCw className="h-3.5 w-3.5" />
+                      <span>Retry Preview</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={onRecapture}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 px-3.5 py-2 text-xs font-semibold text-white cursor-pointer"
+                    >
+                      <RotateCcw className="h-3.5 w-3.5" />
+                      <span>Recapture Site</span>
+                    </button>
+                  </div>
+                </div>
+              ) : previewUrl ? (
                 <iframe
+                  ref={iframeRef}
+                  key={`${jobId}-main-${previewRevision}`}
                   title={`Captured preview of ${hostname}`}
                   src={previewUrl}
                   sandbox="allow-scripts allow-forms"
-                  className="h-[480px] w-full bg-white"
+                  onLoad={() => setIsIframeLoading(false)}
+                  onError={() => {
+                    setIsIframeLoading(false);
+                    setPreviewUnavailable('Unable to load preview frame. Click Retry Preview or Recapture.');
+                  }}
+                  className={`${expandedHeight ? 'h-[680px]' : 'h-[520px]'} w-full bg-white`}
                 />
               ) : (
-                <div className="h-[480px] w-full flex items-center justify-center bg-slate-950 text-xs text-slate-400 gap-2">
+                <div
+                  className={`${
+                    expandedHeight ? 'h-[680px]' : 'h-[520px]'
+                  } w-full flex items-center justify-center bg-slate-950 text-xs text-slate-400 gap-2`}
+                >
                   <Loader2 className="h-4 w-4 animate-spin text-sky-500" />
                   <span>Preparing preview...</span>
                 </div>
